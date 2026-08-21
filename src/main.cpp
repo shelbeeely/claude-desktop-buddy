@@ -837,8 +837,9 @@ static int16_t drawInfoPage(uint32_t now, int16_t y) {
     ln(Color::Black, BoardConfig::ACTIVE.name);
     // Read the actual silicon rather than keeping a per-board S3-vs-C3
     // boolean list here — every new S3 board this project adds would
-    // otherwise need this line touched again (it already had to be, three
-    // times over: X4 Pro, then Murphy/PaperS3, then LilyGo/PaperColor).
+    // otherwise need this line touched again (it already had to be, four
+    // times over: X4 Pro, then Murphy/PaperS3, then LilyGo/PaperColor, then
+    // de-link).
     ln(Color::Black, ESP.getChipModel());
   }
   return y;
@@ -1616,6 +1617,10 @@ void setup() {
   // BoardT5S3::begin() (LilyGo) on their own. Gating on display.sclk being
   // assigned (not PIN_UNASSIGNED) excludes both boards correctly alongside
   // the busWidth check, without needing a per-board name comparison.
+  // Boards with native SDMMC (X4 Pro: 1-bit; de-link: 4-bit — BoardConfig.h
+  // DE_LINK.sdmmc, ~line 1108) never enter this branch either: their SD
+  // card is on entirely separate pins, not a shared SPI bus, and
+  // sdmmc.busWidth != 0 for both.
   if (BoardConfig::ACTIVE.sdmmc.busWidth == 0 && BoardConfig::ACTIVE.display.sclk != BoardConfig::PIN_UNASSIGNED) {
     SPI.begin(BoardConfig::ACTIVE.display.sclk, BoardConfig::ACTIVE.sd.miso, BoardConfig::ACTIVE.display.mosi,
               BoardConfig::ACTIVE.display.cs);
