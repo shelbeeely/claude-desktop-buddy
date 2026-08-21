@@ -370,30 +370,12 @@ partition scheme — the generic `esp32-c3-devkitm-1` board definition's
 stock partition table targets a 4MB part and is too small for this image;
 X4 is a real 16MB part per `platformio.sample.ini`, so this port's env sets
 `board_build.partitions = default_16MB.csv` explicitly). The RAM figure is
-static `.data`/`.bss` only, from the linker's own accounting — the same
-convention the Reticulum node build's ~46%/~52% figures use. It does
+static `.data`/`.bss` only, from the linker's own accounting. It does
 **not** include the ~48KB single-buffer e-paper framebuffer (`displayWidth
 / 8 * displayHeight` = 100 × 480), which `FreeInkDisplay::begin()`
 heap-allocates at runtime, nor NimBLE's own heap usage — both come out of
 the same ~295KB of DRAM left after the static image, alongside whatever
 `ArduinoJson`'s `JsonDocument` needs per incoming heartbeat.
-
-**Radio coexistence with the Reticulum node work — flagged, not answered.**
-The task asked this to be an explicit answer, not a guess, and it can't be
-answered from what's in scope here: I don't have the Reticulum node
-firmware's own memory footprint or its use of the radio to check against.
-What the X4 port *can* say with the SDK evidence in hand: ESP32-C3 has a
-single 2.4GHz radio shared between WiFi and BLE — concurrent use always
-goes through ESP-IDF's WiFi/BT coexistence time-division arbiter, which
-means BLE notification latency (and the desktop bridge's ~10s keepalive
-budget) will be affected by whatever duty cycle the Reticulum node's WiFi
-traffic runs at, in both directions. On the RAM side, this port's own
-static+heap footprint (see above) leaves roughly 200KB+ of the C3's 320KB
-DRAM at idle; whether that is enough headroom once a WiFi stack (commonly
-tens of KB) and Reticulum's own packet buffers are added **needs measuring
-against the actual Reticulum firmware**, not estimating from this repo
-alone. Don't ship both stacks on one X4 without profiling that
-combination on hardware.
 
 ### Divergences from the original buddy (explicit callouts)
 
