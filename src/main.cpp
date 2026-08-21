@@ -773,7 +773,11 @@ static void drawInfoPage(uint32_t now, int16_t y) {
     y += 8;
     ln(Color::DarkGray, "hardware");
     ln(Color::Black, BoardConfig::ACTIVE.name);
-    ln(Color::Black, BoardConfig::isX4Pro() ? "ESP32-S3" : "ESP32-C3");
+    // Chip family, read from silicon rather than hand-picked per board — an
+    // isX4Pro()-style ternary broke the moment a second ESP32-S3 board
+    // (Paper Mono) joined X4 Pro, and every future S3 board would need the
+    // same fix again.
+    ln(Color::Black, ESP.getChipModel());
   }
 }
 
@@ -1303,10 +1307,16 @@ void setup() {
   // Claiming it once here, with the SD MISO included, before display.begin()
   // runs its own SPI.begin(), is exactly the sequence Free-Ink's own X4
   // consumer app (inkdeck, src/main.cpp setup()) uses for this same board.
-  // X4 Pro doesn't need this: its SD card is native SDMMC on entirely
-  // separate pins (CLK41/CMD42/DAT40), not a shared SPI bus — see
-  // freeink-sdk/docs/xteink-x4pro-support.md "Storage".
-  if (!BoardConfig::isX4Pro()) {
+  //
+  // The real condition is "does this board even put SD on the display's SPI
+  // bus" — not "is this X4 Pro". Any board whose SD card is native SDMMC
+  // (BoardConfig::ACTIVE.sdmmc.busWidth != 0 — a distinct ESP32 peripheral,
+  // no shared SCLK/MOSI/CS with the display at all) needs no pre-claim: X4
+  // Pro's card is on CLK41/CMD42/DAT40 (freeink-sdk/docs/xteink-x4pro-support.md
+  // "Storage"; BoardConfig.h's XTEINK_X4_PRO sdmmc field), and Paper Mono's is
+  // native SDMMC too (BoardConfig.h:968 sdmmc busWidth=4, cited in
+  // docs/board-notes/paper-mono.md).
+  if (BoardConfig::ACTIVE.sdmmc.busWidth == 0) {
     SPI.begin(BoardConfig::ACTIVE.display.sclk, BoardConfig::ACTIVE.sd.miso, BoardConfig::ACTIVE.display.mosi,
               BoardConfig::ACTIVE.display.cs);
   }
