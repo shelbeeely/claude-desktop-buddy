@@ -1,11 +1,16 @@
-# claude-desktop-buddy
+# Free Ink Claude Buddy
 
-Claude for macOS and Windows can connect Claude Cowork and Claude Code to
-maker devices over BLE, so developers and makers can build hardware that
-displays permission prompts, recent messages, and other interactions. We've
-been impressed by the creativity of the maker community around Claude -
-providing a lightweight, opt-in API is our way of making it easier to build
-fun little hardware devices that integrate with Claude.
+This is a [FreeInk SDK](https://github.com/Free-Ink/freeink-sdk) project
+first: the SDK's e-paper display, input, and board-abstraction layers do
+the actual work of driving the panel, and everything specific to Claude is
+a layer on top of that. What it happens to speak is Claude's BLE desk-pet
+protocol — Claude for macOS and Windows can connect Claude Cowork and
+Claude Code to maker devices over BLE, so developers and makers can build
+hardware that displays permission prompts, recent messages, and other
+interactions. We've been impressed by the creativity of the maker
+community around Claude - providing a lightweight, opt-in API is our way
+of making it easier to build fun little hardware devices that integrate
+with Claude.
 
 > **Building your own device?** You don't need any of the code here. See
 > **[REFERENCE.md](REFERENCE.md)** for the wire protocol: Nordic UART
