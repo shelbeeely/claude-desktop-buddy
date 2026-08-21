@@ -330,6 +330,17 @@ static bool responseSent = false;
 static char lastPromptId[40] = "";
 static uint32_t promptArrivedMs = 0;
 
+// Screen sleep (POWER button — see "Input mapping" below). Gates loop()'s
+// render/refresh calls; handleInput() wakes on any press while asleep.
+static bool screenAwake = true;
+
+// Transcript scroll (LEFT/RIGHT). tama.lineGen bumps whenever tama.lines
+// changes (see data.h) — loop() resets transcriptOffset on that so a
+// scrolled-away view never shows stale entries against new data.
+static constexpr uint8_t TRANSCRIPT_VISIBLE = 6;
+static uint8_t transcriptOffset = 0;
+static uint16_t lastLineGen = 0;
+
 static void drawStatusPanel(uint32_t now) {
   ui().fill(Rect{PANEL_X, 0, PANEL_W, 480}, Paint::solid(Color::White));
 
@@ -365,6 +376,27 @@ static void drawStatusPanel(uint32_t now) {
     y += 24;
     ui().text(Rect{PANEL_X, y, PANEL_W, 20}, tama.msg, TextStyle{0, TextAlign::Left, Color::DarkGray, 1, false, false});
     y += 28;
+
+    // Transcript (LEFT/RIGHT scroll — see "Input mapping"). tama.lines is
+    // newest-first; transcriptOffset 0 shows the newest TRANSCRIPT_VISIBLE
+    // entries.
+    if (tama.nLines > 0) {
+      uint8_t maxOffset = tama.nLines > TRANSCRIPT_VISIBLE ? tama.nLines - TRANSCRIPT_VISIBLE : 0;
+      if (transcriptOffset > maxOffset) transcriptOffset = maxOffset;
+      char hdr[40];
+      if (maxOffset > 0) {
+        snprintf(hdr, sizeof(hdr), "transcript  <- %u/%u ->", transcriptOffset + 1, maxOffset + 1);
+      } else {
+        snprintf(hdr, sizeof(hdr), "transcript");
+      }
+      ui().text(Rect{PANEL_X, y, PANEL_W, 18}, hdr, TextStyle{0, TextAlign::Left, Color::DarkGray, 1, false, false});
+      y += 22;
+      for (uint8_t i = 0; i < TRANSCRIPT_VISIBLE && (transcriptOffset + i) < tama.nLines; i++) {
+        ui().text(Rect{PANEL_X, y, PANEL_W, 20}, tama.lines[transcriptOffset + i],
+                  TextStyle{0, TextAlign::Left, Color::Black, 1, false, false});
+        y += 22;
+      }
+    }
   }
 
   y = 340;
@@ -384,17 +416,19 @@ static void drawStatusPanel(uint32_t now) {
 // M5Stick — it's 7 distinct semantic buttons (BACK/CONFIRM/LEFT/RIGHT/UP/
 // DOWN/POWER) off two resistor-ladder ADC pins, decoded by InputManager (see
 // README "Input mapping" for the full verification trail against the SDK
-// headers). That's MORE inputs than the M5 build's 3 physical buttons, so
-// nothing needs to be combined — every required action gets its own button:
-//   CONFIRM        approve (in a prompt) / wake+advance otherwise
-//   BACK           deny (in a prompt) / dismiss otherwise
-//   LEFT / RIGHT   scroll transcript
-//   UP / DOWN      reserved (menu nav if a settings screen is added later)
-//   DOWN long-press  manual "dizzy" trigger — substitute for the M5 build's
-//                    shake gesture, which needed an IMU the X4 does not have
-//                    (BoardConfig::XTEINK_X4 has ImuType::None; confirmed via
-//                    InputManager/BoardConfig, not assumed)
-//   POWER          reserved, not yet wired to any action
+// headers). Every button does something:
+//   CONFIRM        approve (in a prompt) — otherwise a no-op unless the
+//                  screen is asleep, in which case any button just wakes it
+//   BACK           deny (in a prompt) — same "otherwise" rule as CONFIRM
+//   LEFT / RIGHT   scroll the transcript panel
+//   UP             force a full e-paper refresh now (clears ghosting on
+//                  demand instead of waiting for FULL_REFRESH_INTERVAL_MS)
+//   DOWN           reserved for a short tap; long-press (~800ms) triggers
+//                  "dizzy" — substitute for the M5 build's shake gesture,
+//                  which needed an IMU the X4 does not have
+//                  (BoardConfig::XTEINK_X4 has ImuType::None; confirmed via
+//                  InputManager/BoardConfig, not assumed)
+//   POWER          toggle screen sleep — sleepScreen()/wakeScreen() below
 // Face-down nap (also IMU-driven) is dropped outright rather than remapped —
 // there's no button gesture that means the same thing. See README.
 static void sendCmd(const char* json) {
@@ -402,6 +436,34 @@ static void sendCmd(const char* json) {
   size_t n = strlen(json);
   bleWrite((const uint8_t*)json, n);
   bleWrite((const uint8_t*)"\n", 1);
+}
+
+// Blanks the panel and halts rendering until woken. Mirrors the earlier
+// desktop-buddy generation's "screen auto-powers off, any button wakes it"
+// behavior, given here as an explicit POWER toggle instead of an idle timer
+// (no idle timer exists on this board yet).
+static void sleepScreen(uint32_t now) {
+  screenAwake = false;
+  ui().fill(Rect{0, 0, 800, 480}, Paint::solid(Color::White));
+  ui().text(Rect{0, 220, 800, 40}, "sleeping - press any button",
+            TextStyle{0, TextAlign::Center, Color::DarkGray, 1, false, false});
+  display.displayBuffer(EInkDisplay::FULL_REFRESH);
+  lastFullRefreshMs = now;
+}
+
+// lastSpriteDrawMs is reset so renderSprite()'s per-state cadence gate
+// (e.g. P_IDLE's 1500ms check) doesn't skip this draw just because it
+// last ran shortly before sleepScreen() — without that reset the forced
+// FULL_REFRESH below could push a stale/blank sprite region.
+static void wakeScreen(uint32_t now) {
+  screenAwake = true;
+  stateEnteredMs = now;
+  sleepFrameDrawn = false;
+  lastSpriteDrawMs = 0;
+  drawStatusPanel(now);
+  renderSprite(now);
+  display.displayBuffer(EInkDisplay::FULL_REFRESH);
+  lastFullRefreshMs = now;
 }
 
 static uint32_t downPressStart = 0;
@@ -419,6 +481,19 @@ static bool     downLongFired = false;
 // asyncPoll(). Only wasPressed()/update() are unsafe to call ourselves
 // once async polling owns the edge state; edges come from popPress().
 static void handleInput(uint32_t now) {
+  if (!screenAwake) {
+    // Any press just wakes the screen — never doubles as that button's
+    // normal action, so a CONFIRM that wakes the device can't also
+    // silently approve a prompt the user hasn't seen yet.
+    uint8_t btn;
+    bool anyPress = false;
+    while (input.popPress(btn)) anyPress = true;
+    if (anyPress) wakeScreen(now);
+    downPressStart = 0;
+    downLongFired = false;
+    return;
+  }
+
   uint8_t btn;
   while (input.popPress(btn)) {
     bool inPrompt = tama.promptId[0] && !responseSent;  // re-checked per event: the
@@ -438,6 +513,17 @@ static void handleInput(uint32_t now) {
       sendCmd(cmd);
       responseSent = true;
       statsOnDenial();
+    } else if (btn == InputManager::BTN_LEFT) {
+      if (transcriptOffset > 0) transcriptOffset--;
+    } else if (btn == InputManager::BTN_RIGHT) {
+      uint8_t maxOffset = tama.nLines > TRANSCRIPT_VISIBLE ? tama.nLines - TRANSCRIPT_VISIBLE : 0;
+      if (transcriptOffset < maxOffset) transcriptOffset++;
+    } else if (btn == InputManager::BTN_UP) {
+      display.displayBuffer(EInkDisplay::FULL_REFRESH);
+      lastFullRefreshMs = now;
+    } else if (btn == InputManager::BTN_POWER) {
+      sleepScreen(now);
+      return;  // screen is asleep now; the rest of this batch no longer applies
     }
   }
 
@@ -519,6 +605,12 @@ void loop() {
   uint32_t now = millis();
 
   dataPoll(&tama);
+
+  // Never let a sleeping screen sit through an approval prompt unseen.
+  if (!screenAwake && tama.promptId[0] && strcmp(tama.promptId, lastPromptId) != 0) {
+    wakeScreen(now);
+  }
+
   handleInput(now);
 
   if (strcmp(tama.promptId, lastPromptId) != 0) {
@@ -526,6 +618,13 @@ void loop() {
     lastPromptId[sizeof(lastPromptId) - 1] = 0;
     responseSent = false;
     if (tama.promptId[0]) promptArrivedMs = now;
+  }
+
+  // New transcript data invalidates any scrolled-away view (see data.h's
+  // lineGen comment: "lets UI reset scroll").
+  if (tama.lineGen != lastLineGen) {
+    lastLineGen = tama.lineGen;
+    transcriptOffset = 0;
   }
 
   baseState = derive(tama);
@@ -536,6 +635,11 @@ void loop() {
     stateEnteredMs = now;
     sleepFrameDrawn = false;
     lastRenderedState = activeState;
+  }
+
+  if (!screenAwake) {
+    delay(16);
+    return;
   }
 
   // Panel drawn first: renderSprite() can trigger a FULL_REFRESH (celebrate),

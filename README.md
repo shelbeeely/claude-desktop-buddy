@@ -104,16 +104,21 @@ If discovery isn't finding the device:
 ## Controls
 
 Per the seven-button ADC ladder above, there's a 1:1 mapping with no
-combining required:
+combining required. Every button does something:
 
 | Button                       | Normal                                        | On an approval prompt |
 | ----------------------------- | ---------------------------------------------- | ---------------------- |
-| `CONFIRM`                     | wake / advance                                 | **approve**             |
-| `BACK`                        | dismiss                                        | **deny**                |
-| `LEFT` / `RIGHT`               | scroll transcript                              | —                        |
-| `UP` / `DOWN`                  | reserved (unused by this firmware)             | —                        |
+| `CONFIRM`                     | no-op (or wakes the screen if it's asleep)     | **approve**             |
+| `BACK`                        | no-op (or wakes the screen if it's asleep)     | **deny**                |
+| `LEFT` / `RIGHT`               | scroll the transcript panel                    | —                        |
+| `UP`                           | force a full e-paper refresh now (clears ghosting on demand instead of waiting for the 5-minute timer) | —                        |
 | `DOWN` (long-press, ~800ms)    | trigger `dizzy` for 2s — the closest substitute for a shake gesture, since the X4 has no IMU | —                        |
-| `POWER`                        | reserved                                       | —                        |
+| `POWER`                        | toggle screen sleep — blanks the panel and halts rendering; any button press wakes it | —                        |
+
+A sleeping screen always just wakes on the first press — that press never
+also fires the button's normal action, so waking the device can't
+accidentally approve or deny a prompt you haven't seen yet. An incoming
+approval prompt wakes a sleeping screen automatically so it's never missed.
 
 **Input polling is async, not synchronous with the render loop.**
 `display.displayWindow()`/`displayBuffer()` block the main loop for
@@ -297,8 +302,8 @@ multi-pack selection UI: the first `*.charpack` found wins.
 ## Resource budget
 
 ```
-RAM:   [==        ]  15.2% (used 49668 bytes from 327680 bytes)
-Flash: [==        ]  21.7% (used 1420199 bytes from 6553600 bytes)
+RAM:   [==        ]  15.2% (used 49652 bytes from 327680 bytes)
+Flash: [==        ]  21.6% (used 1414257 bytes from 6553600 bytes)
 ```
 
 From `pio run -e xteink_x4`'s size report (ESP32-C3, `default_16MB.csv`
