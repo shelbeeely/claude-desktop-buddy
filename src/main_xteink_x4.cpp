@@ -14,6 +14,10 @@
 //                          (BUDDY_SUPPORTS_CHAR_PUSH=0 — see xfer.h and the
 //                          README "Divergences" section)
 //
+// sd_character_pack.h/.cpp (new for this port) optionally replaces the
+// compiled-in bufo icons below with one discovered on the SD card at boot —
+// see README.md "SD-backed character packs".
+//
 // See README.md "Xteink X4 port" for the sprite-region size, the full-refresh
 // timer interval, and the final input mapping, and for every place this file
 // diverges from the M5 build's behavior because of e-ink or X4 hardware.
@@ -26,10 +30,13 @@
 #include <InputManager.h>
 #include <BatteryMonitor.h>
 #include <FreeInkUIDisplayTarget.h>
+#include <SDCardManager.h>
+#include <SPI.h>
 
 #include "ble_bridge.h"
 #include "data.h"
 #include "assets/icons_bufo.h"
+#include "sd_character_pack.h"
 
 using freeink::ui::Color;
 using freeink::ui::DisplayTarget;
@@ -200,6 +207,37 @@ static const freeink::Icon* currentFrame(PersonaState state, uint32_t now, uint3
   return clip.frames[clip.frameCount - 1].icon;
 }
 
+// --- SD-backed character (optional) ------------------------------------------
+// See README.md "SD-backed character packs": if a .charpack file is found on
+// the SD card at boot, it replaces the compiled-in bufo icons for every
+// state. Falls back to bufo automatically if there's no SD card, no pack on
+// it, or a read hiccup mid-animation (getCurrentIcon() below) — the device
+// is never left with nothing to draw.
+static SdCharacterPack sdPack;
+static bool sdCharacterActive = false;
+// Covers up to ~320x400px @ 1bpp (⌈320/8⌉ * 400 = 16000) with margin over
+// bufo's 192x200. A pack whose frames exceed this is the operator's to
+// avoid by choosing --scale appropriately when converting it — there is no
+// runtime dimension check here, same as the compiled-in asset (see README).
+static constexpr size_t SD_FRAME_BUF_CAP = 16000;
+static uint8_t sdFrameBuf[SD_FRAME_BUF_CAP];
+
+// Resolves to an Icon for (state, now-stateEnteredMs), preferring the SD
+// pack when one is active and falling back to the compiled-in bufo tables
+// otherwise (or on an SD read failure). Returns false only if neither
+// source has anything for `state`, which shouldn't happen for the 7
+// required states.
+static bool getCurrentIcon(PersonaState state, uint32_t now, uint32_t stateEnteredMs, freeink::Icon& out) {
+  if (sdCharacterActive) {
+    uint32_t elapsed = now - stateEnteredMs;
+    if (sdPack.getFrame((uint8_t)state, elapsed, out, sdFrameBuf, sizeof(sdFrameBuf))) return true;
+  }
+  const freeink::Icon* p = currentFrame(state, now, stateEnteredMs);
+  if (!p) return false;
+  out = *p;
+  return true;
+}
+
 // --- Refresh strategy --------------------------------------------------------
 // See README "Refresh strategy" for the rationale behind each state's
 // cadence/mode. Nothing here is uniform on purpose.
@@ -215,7 +253,10 @@ static void renderSprite(uint32_t now) {
       // until the state changes (checked by the caller via sleepFrameDrawn).
       if (sleepFrameDrawn) return;
       clearSpriteRegion();
-      drawIconCentered(*currentFrame(P_SLEEP, now, stateEnteredMs));
+      {
+        freeink::Icon icon;
+        if (getCurrentIcon(P_SLEEP, now, stateEnteredMs, icon)) drawIconCentered(icon);
+      }
       display.displayWindow(SPRITE_X, SPRITE_Y, SPRITE_W, SPRITE_H);
       sleepFrameDrawn = true;
       return;
@@ -225,7 +266,10 @@ static void renderSprite(uint32_t now) {
       // charming, not laggy (per the original README's framing).
       if (now - lastSpriteDrawMs < 1500) return;
       clearSpriteRegion();
-      drawIconCentered(*currentFrame(P_IDLE, now, stateEnteredMs));
+      {
+        freeink::Icon icon;
+        if (getCurrentIcon(P_IDLE, now, stateEnteredMs, icon)) drawIconCentered(icon);
+      }
       display.displayWindow(SPRITE_X, SPRITE_Y, SPRITE_W, SPRITE_H);
       break;
 
@@ -234,7 +278,10 @@ static void renderSprite(uint32_t now) {
       // animation and wants to read as active.
       if (now - lastSpriteDrawMs < 350) return;
       clearSpriteRegion();
-      drawIconCentered(*currentFrame(P_BUSY, now, stateEnteredMs));
+      {
+        freeink::Icon icon;
+        if (getCurrentIcon(P_BUSY, now, stateEnteredMs, icon)) drawIconCentered(icon);
+      }
       display.displayWindow(SPRITE_X, SPRITE_Y, SPRITE_W, SPRITE_H);
       break;
 
@@ -246,7 +293,10 @@ static void renderSprite(uint32_t now) {
       // color plane.
       if (now - lastSpriteDrawMs < 400) return;
       clearSpriteRegion();
-      drawIconCentered(*currentFrame(P_ATTENTION, now, stateEnteredMs));
+      {
+        freeink::Icon icon;
+        if (getCurrentIcon(P_ATTENTION, now, stateEnteredMs, icon)) drawIconCentered(icon);
+      }
       attentionFlashOn = !attentionFlashOn;
       if (attentionFlashOn) invertSpriteRegionBytes();
       display.displayWindow(SPRITE_X, SPRITE_Y, SPRITE_W, SPRITE_H);
@@ -259,9 +309,9 @@ static void renderSprite(uint32_t now) {
       // clip can't turn a celebration into a multi-second stall.
       if (now - lastSpriteDrawMs < 220) return;
       clearSpriteRegion();
-      const freeink::Icon* f = currentFrame(P_CELEBRATE, now, stateEnteredMs);
-      if (!f) break;
-      drawIconCentered(*f);
+      freeink::Icon icon;
+      if (!getCurrentIcon(P_CELEBRATE, now, stateEnteredMs, icon)) break;
+      drawIconCentered(icon);
       display.displayBuffer(EInkDisplay::FULL_REFRESH);
       lastFullRefreshMs = now;  // this refresh already DC-balanced the panel
       break;
@@ -269,10 +319,13 @@ static void renderSprite(uint32_t now) {
 
     case P_DIZZY:
       // Short-lived, fast partial — triggered by a button hold (no IMU on
-      // this board; see the input-mapping comment in loop()).
+      // this board; see the input-mapping comment above handleInput()).
       if (now - lastSpriteDrawMs < 200) return;
       clearSpriteRegion();
-      drawIconCentered(*currentFrame(P_DIZZY, now, stateEnteredMs));
+      {
+        freeink::Icon icon;
+        if (getCurrentIcon(P_DIZZY, now, stateEnteredMs, icon)) drawIconCentered(icon);
+      }
       display.displayWindow(SPRITE_X, SPRITE_Y, SPRITE_W, SPRITE_H);
       break;
 
@@ -281,7 +334,10 @@ static void renderSprite(uint32_t now) {
       // not full — it fires far more often (every fast approval).
       if (now - lastSpriteDrawMs < 250) return;
       clearSpriteRegion();
-      drawIconCentered(*currentFrame(P_HEART, now, stateEnteredMs));
+      {
+        freeink::Icon icon;
+        if (getCurrentIcon(P_HEART, now, stateEnteredMs, icon)) drawIconCentered(icon);
+      }
       display.displayWindow(SPRITE_X, SPRITE_Y, SPRITE_W, SPRITE_H);
       break;
 
@@ -373,12 +429,24 @@ static void sendCmd(const char* json) {
 static uint32_t downPressStart = 0;
 static bool     downLongFired = false;
 
+// InputManager runs on a background FreeRTOS task (input.beginAsync() in
+// setup()), not on our own polling here — required because
+// display.displayWindow()/displayBuffer() block the main loop for
+// anywhere from ~50ms (a small partial) to ~2s (a full refresh, per
+// FreeInkDisplay's own docs), and a CONFIRM/BACK press-and-release that
+// happens entirely inside one of those blocking calls would otherwise
+// never be seen. The async task calls update() itself, so isPressed()
+// (a plain level read of the task's currentState) is still safe to read
+// from here for the DOWN long-press check below — see InputManager.cpp's
+// asyncPoll(). Only wasPressed()/update() are unsafe to call ourselves
+// once async polling owns the edge state; edges come from popPress().
 static void handleInput(uint32_t now) {
-  input.update();
-  bool inPrompt = tama.promptId[0] && !responseSent;
-
-  if (input.wasPressed(InputManager::BTN_CONFIRM)) {
-    if (inPrompt) {
+  uint8_t btn;
+  while (input.popPress(btn)) {
+    bool inPrompt = tama.promptId[0] && !responseSent;  // re-checked per event: the
+                                                         // first popped press in a
+                                                         // burst can flip responseSent
+    if (btn == InputManager::BTN_CONFIRM && inPrompt) {
       char cmd[96];
       snprintf(cmd, sizeof(cmd), "{\"cmd\":\"permission\",\"id\":\"%s\",\"decision\":\"once\"}", tama.promptId);
       sendCmd(cmd);
@@ -386,11 +454,7 @@ static void handleInput(uint32_t now) {
       uint32_t tookS = (now - promptArrivedMs) / 1000;
       statsOnApproval(tookS);
       if (tookS < 5) triggerOneShot(P_HEART, 2000);
-    }
-  }
-
-  if (input.wasPressed(InputManager::BTN_BACK)) {
-    if (inPrompt) {
+    } else if (btn == InputManager::BTN_BACK && inPrompt) {
       char cmd[96];
       snprintf(cmd, sizeof(cmd), "{\"cmd\":\"permission\",\"id\":\"%s\",\"decision\":\"deny\"}", tama.promptId);
       sendCmd(cmd);
@@ -413,11 +477,43 @@ static void handleInput(uint32_t now) {
 }
 
 // ---------------------------------------------------------------------------
+// Scans /characters for the first *.charpack file and opens it, replacing
+// the compiled-in bufo icons for every state. No selection UI yet — see
+// README.md "SD-backed character packs" for why (v1 scope: this is the
+// CrossPoint SdCardFontSystem "manual SD copy" install path, not the BLE
+// push path — the SD card just needs one .charpack file on it).
+static void loadSdCharacterIfPresent() {
+  if (!SdMan.ready()) return;
+  for (const String& name : SdMan.listFiles("/characters")) {
+    if (!name.endsWith(".charpack")) continue;
+    String path = "/characters/" + name;
+    if (sdPack.open(path.c_str())) {
+      sdCharacterActive = true;
+      Serial.printf("[sd] loaded character pack %s\n", path.c_str());
+    }
+    return;  // first *.charpack wins, found or not — don't keep scanning
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   statsLoad();
   settingsLoad();
   petNameLoad();
+
+  // X3/X4 share the display's SPI bus with the SD card slot (BoardConfig::
+  // XTEINK_X4.sd: sclk/mosi unassigned, separateSpi=false — miso(7) and
+  // cs(12) are the only pins unique to the card). FreeInkDisplay::begin()
+  // only wires MISO into the bus when the active panel driver needs it
+  // (PanelDriver::spiMiso() defaults to -1 for SSD1677/X4 — the display
+  // itself is write-only); left alone, the bus would come up with no MISO
+  // pin and SD reads would never work afterward, since a second SPI.begin()
+  // with different pins is unreliable once the bus is already initialized.
+  // Claiming it once here, with the SD MISO included, before display.begin()
+  // runs its own SPI.begin(), is exactly the sequence Free-Ink's own X4
+  // consumer app (inkdeck, src/main.cpp setup()) uses for this same board.
+  SPI.begin(BoardConfig::ACTIVE.display.sclk, BoardConfig::ACTIVE.sd.miso, BoardConfig::ACTIVE.display.mosi,
+            BoardConfig::ACTIVE.display.cs);
 
   display.begin();
   uiPtr = new (uiStorage) DisplayTarget(display.getFrameBuffer(), display.getDisplayWidth(),
@@ -427,7 +523,11 @@ void setup() {
   display.displayBuffer(EInkDisplay::FULL_REFRESH);
   lastFullRefreshMs = millis();
 
+  SdMan.begin();  // false if no card present — loadSdCharacterIfPresent() below no-ops either way
+  loadSdCharacterIfPresent();
+
   input.begin();
+  input.beginAsync();  // see handleInput()'s comment for why this is required
 
   uint8_t mac[6] = {0};
   esp_read_mac(mac, ESP_MAC_BT);

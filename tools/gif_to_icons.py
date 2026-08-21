@@ -32,16 +32,44 @@ manifest's own "single filename or list of filenames" shape (the list is
 the idle-carousel rotation from the original README) so nothing about the
 per-state structure is invented here, just re-expressed as compiled data.
 
+--sd-out additionally writes a binary ".charpack" with the same frame data,
+for a character stored on the SD card instead of compiled into flash — see
+src/sd_character_pack.h and README.md "SD-backed character packs" for the
+on-device reader and the format this binary uses (a fixed-size state/clip/
+frame index, so the reader loads only the ~2-3KB index into RAM and reads
+one frame's packed bits on demand, never the whole pack).
+
 Usage:
     python3 tools/gif_to_icons.py characters/bufo \\
-        --scale 2 --out src/assets/icons_bufo.h --namespace bufo
+        --scale 2 --out src/assets/icons_bufo.h --namespace bufo \\
+        --sd-out characters/bufo/bufo.charpack
 """
 import argparse
 import json
+import struct
 import sys
 from pathlib import Path
 
 from PIL import Image, ImageSequence
+
+# .charpack binary layout (all little-endian, matches ESP32-C3's native
+# endianness so the on-device reader can memcpy struct fields directly):
+#
+#   Header   (12B): magic="CDBK", version(B), stateCount(B), reserved(H),
+#                    totalClips(H), totalFrames(H)
+#   StateDir (4B * stateCount, fixed order sleep/idle/busy/attention/
+#             celebrate/dizzy/heart): clipStart(H) clipCount(B) reserved(B)
+#   ClipDir  (4B * totalClips): frameStart(H) frameCount(B) reserved(B)
+#   FrameDir (16B * totalFrames): w(H) h(H) opticalCenterY(h) durationMs(H)
+#             dataOffset(I) dataLength(I) -- dataOffset is absolute from the
+#             start of the file, so the reader never needs to compute it.
+#   <raw 1bpp frame bytes, back to back, referenced by FrameDir>
+_HEADER_FMT = "<4sBBHHH"
+_STATE_FMT = "<HBB"
+_CLIP_FMT = "<HBB"
+_FRAME_FMT = "<HHhHII"
+_MAGIC = b"CDBK"
+_VERSION = 1
 
 STATES = ["sleep", "idle", "busy", "attention", "celebrate", "dizzy", "heart"]
 THRESHOLD = 128       # luminance below this (0-255) counts as ink
@@ -98,12 +126,53 @@ def load_clip(gif_path, scale):
     return frames
 
 
+def write_charpack(path, bin_states):
+    """bin_states: list of 7 states, each a list of clips, each a list of
+    (w, h, center, data_bytes, duration_ms) frames — see the format comment
+    above. Layout is fixed-size-record-first so the on-device reader can
+    seek straight to any frame's index entry without parsing anything
+    variable-length."""
+    total_clips = sum(len(clips) for clips in bin_states)
+    total_frames = sum(len(frames) for clips in bin_states for frames in clips)
+
+    header_size = struct.calcsize(_HEADER_FMT)
+    state_dir_size = struct.calcsize(_STATE_FMT) * len(bin_states)
+    clip_dir_size = struct.calcsize(_CLIP_FMT) * total_clips
+    frame_dir_size = struct.calcsize(_FRAME_FMT) * total_frames
+    data_start = header_size + state_dir_size + clip_dir_size + frame_dir_size
+
+    state_dir = bytearray()
+    clip_dir = bytearray()
+    frame_dir = bytearray()
+    data = bytearray()
+    clip_cursor = 0
+    frame_cursor = 0
+    data_offset = data_start
+
+    for clips in bin_states:
+        state_dir += struct.pack(_STATE_FMT, clip_cursor, len(clips), 0)
+        clip_cursor += len(clips)
+        for frames in clips:
+            clip_dir += struct.pack(_CLIP_FMT, frame_cursor, len(frames), 0)
+            frame_cursor += len(frames)
+            for w, h, center, frame_bytes, duration in frames:
+                frame_dir += struct.pack(_FRAME_FMT, w, h, center, duration, data_offset, len(frame_bytes))
+                data += frame_bytes
+                data_offset += len(frame_bytes)
+
+    header = struct.pack(_HEADER_FMT, _MAGIC, _VERSION, len(bin_states), 0, total_clips, total_frames)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(bytes(header) + bytes(state_dir) + bytes(clip_dir) + bytes(frame_dir) + bytes(data))
+    return len(header) + len(state_dir) + len(clip_dir) + len(frame_dir) + len(data)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("character_dir", type=Path)
     ap.add_argument("--scale", type=int, default=2, help="integer upscale from the 96px-wide source (default 2x -> 192px)")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--namespace", required=True, help="C identifier prefix, e.g. bufo")
+    ap.add_argument("--sd-out", type=Path, help="also write a .charpack binary for SD storage (see src/sd_character_pack.h)")
     args = ap.parse_args()
 
     manifest_path = args.character_dir / "manifest.json"
@@ -146,17 +215,22 @@ def main():
 
     max_w = max_h = 0
     state_clip_syms = {}
+    # Mirrors the .h structure exactly, for --sd-out: bin_states[state] is a
+    # list of clips, each a list of (w, h, center, data_bytes, duration).
+    bin_states = []
 
     for state in STATES:
         entry = manifest["states"][state]
         clip_files = entry if isinstance(entry, list) else [entry]
         clip_syms = []
+        bin_clips = []
         for ci, fname in enumerate(clip_files):
             gif_path = args.character_dir / fname
             if not gif_path.exists():
                 sys.exit(f"missing {gif_path} (state '{state}')")
             frames = load_clip(gif_path, args.scale)
             frame_syms = []
+            bin_frames = []
             for fi, (rgba, duration) in enumerate(frames):
                 data, w, h, center = pack_frame(rgba, bg_rgb)
                 max_w, max_h = max(max_w, w), max(max_h, h)
@@ -168,6 +242,7 @@ def main():
                     f"static const freeink::Icon {icon_sym} = {{{w}, {h}, {center}, {bits_sym}}};"
                 )
                 frame_syms.append((icon_sym, duration))
+                bin_frames.append((w, h, center, bytes(data), duration))
             frames_sym = ident(ns, state, ci, "frames")
             frame_list = ", ".join(f"{{&{sym}, {dur}}}" for sym, dur in frame_syms)
             lines.append(f"static const IconFrame {frames_sym}[] = {{{frame_list}}};")
@@ -177,11 +252,13 @@ def main():
             )
             lines.append("")
             clip_syms.append(clip_sym)
+            bin_clips.append(bin_frames)
         clips_array_sym = ident(ns, state, "clips")
         clips_list = ", ".join(clip_syms)
         lines.append(f"static const IconClip {clips_array_sym}[] = {{{clips_list}}};")
         lines.append("")
         state_clip_syms[state] = (clips_array_sym, len(clip_syms))
+        bin_states.append(bin_clips)
 
     lines.append(f"// Indexed by the 7-state enum, in the order {STATES}.")
     lines.append(f"static const IconState {ns}_states[] = {{")
@@ -202,6 +279,10 @@ def main():
     args.out.write_text("\n".join(lines))
     total_bytes = sum(len(l) for l in lines)
     print(f"wrote {args.out} (~{total_bytes/1024:.1f}KB source, max icon {max_w}x{max_h})")
+
+    if args.sd_out:
+        packed_bytes = write_charpack(args.sd_out, bin_states)
+        print(f"wrote {args.sd_out} ({packed_bytes/1024:.1f}KB)")
 
 
 if __name__ == "__main__":
