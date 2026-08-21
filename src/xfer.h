@@ -28,7 +28,10 @@ const char* ownerName();
 struct PlatformBatteryStatus {
   int pct;   // 0-100
   int mV;    // battery millivolts
-  int mA;    // battery current, negative = charging (always 0 — no charge-status pin)
+  int mA;    // battery current, negative = charging (magnitude unknown: -1 while
+             // charging, 0 otherwise, on the boards whose gauge exposes charging
+             // state at all — see platformBatteryStatus()'s chargingKnown check;
+             // always 0 on X4, which has no charge-status pin)
   bool usb;  // external power present
 };
 PlatformBatteryStatus platformBatteryStatus();
