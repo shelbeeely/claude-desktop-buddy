@@ -1,5 +1,5 @@
 // claude-desktop-buddy — Xteink firmware (X4, X3, X4 Pro, Murphy M3, PaperS3,
-// LilyGo T5 S3, M5 PaperColor).
+// LilyGo T5 S3, M5 PaperColor, de-link, Sticky).
 //
 // Nordic UART Service BLE bridge (ble_bridge.cpp/h) + JSON wire protocol
 // (data.h, xfer.h) + NVS-backed stats/owner/settings (stats.h) driving a
@@ -10,26 +10,30 @@
 // settings menu cycle between them — see README.md "SD-backed character
 // packs" and "Menu system".
 //
-// This one file drives seven boards, two of which (X4, X3) share one
+// This one file drives nine boards, two of which (X4, X3) share one
 // ESP32-C3 binary (env:xteink) picked at runtime by freeink::
 // selectXteinkDevice() in setup(); the rest (X4 Pro, Murphy M3, M5Stack
-// PaperS3, LilyGo T5 S3, M5 PaperColor) are each their own ESP32-S3 binary
-// (env:xteink_x4pro, env:murphy, env:papers3, env:lilygo_t5s3,
-// env:papercolor) but run the same source. Where a board has real hardware
-// the M5-era original also had (X3's IMU/RTC/battery gauge, X4 Pro's
-// touch/frontlight/RTC/gauge, PaperS3's touch/RTC), this file uses it via
-// BoardConfig::hasImu()/hasRtc()/isX4Pro()/isMurphyM3()/isM5PaperS3() and
-// the Imu/Rtc/FrontlightManager libraries; where a board has none of it (X4:
-// BoardConfig::XTEINK_X4 is NO_SENSORS/NO_AUDIO/NO_LEDS/NO_FRONTLIGHT, no
-// RTC; M5 PaperColor similarly lacks touch/frontlight/RTC/gauge), the same
+// PaperS3, LilyGo T5 S3, M5 PaperColor, de-link, Sticky) are each their own
+// ESP32-S3 binary (env:xteink_x4pro, env:murphy, env:papers3,
+// env:lilygo_t5s3, env:papercolor, env:delink, env:sticky) but run the same
+// source. Sticky is UNVERIFIED — freeink-sdk marks it an "Upcoming Device"
+// with no hardware validation; see docs/board-notes/sticky.md. Where a
+// board has real hardware the M5-era original also had (X3's IMU/RTC/
+// battery gauge, X4 Pro's touch/frontlight/RTC/gauge, PaperS3's touch/RTC,
+// Sticky's RTC/IMU/gauge), this file uses it via
+// BoardConfig::hasImu()/hasRtc()/isX4Pro()/isMurphyM3()/isM5PaperS3()/
+// isSticky() and the Imu/Rtc/FrontlightManager libraries; where a board has
+// none of it (X4: BoardConfig::XTEINK_X4 is NO_SENSORS/NO_AUDIO/NO_LEDS/
+// NO_FRONTLIGHT, no RTC; M5 PaperColor similarly lacks touch/frontlight/
+// RTC/gauge; de-link has neither touch/RTC/IMU/gauge), the same
 // button/software substitutes from the X4-only version remain. See
 // README.md "Multi-board support" for the full capability matrix, and "Menu
 // system" for what's substituted versus real per board; see
 // docs/board-notes/murphy-m3.md, docs/board-notes/papers3.md,
-// docs/board-notes/lilygo-t5s3.md, and docs/board-notes/papercolor.md for
-// those boards' port-specific findings. PaperS3 has NO physical buttons at
-// all — see the "PaperS3 touch-only navigation" block near handleInput()
-// below.
+// docs/board-notes/lilygo-t5s3.md, docs/board-notes/papercolor.md,
+// docs/board-notes/delink.md, and docs/board-notes/sticky.md for those
+// boards' port-specific findings. PaperS3 has NO physical buttons at all —
+// see the "PaperS3 touch-only navigation" block near handleInput() below.
 //
 // See README.md for the sprite-region size, the full-refresh timer
 // interval, and the full input mapping.
@@ -837,9 +841,9 @@ static int16_t drawInfoPage(uint32_t now, int16_t y) {
     ln(Color::Black, BoardConfig::ACTIVE.name);
     // Read the actual silicon rather than keeping a per-board S3-vs-C3
     // boolean list here — every new S3 board this project adds would
-    // otherwise need this line touched again (it already had to be, four
+    // otherwise need this line touched again (it already had to be, five
     // times over: X4 Pro, then Murphy/PaperS3, then LilyGo/PaperColor, then
-    // de-link).
+    // de-link, then Sticky).
     ln(Color::Black, ESP.getChipModel());
   }
   return y;
@@ -1605,8 +1609,12 @@ void setup() {
   // Murphy M3 and correctly extends to it: Murphy's SD is plain SPI
   // (sdmmc.busWidth == 0, see docs/board-notes/murphy-m3.md), as is M5
   // PaperColor's (M5STACK_PAPER_COLOR.sd: sclk(15)/mosi(13) shared with the
-  // display, separateSpi=false, BoardConfig.h:887-895), so both stay on
-  // this pre-claim path like X3/X4, not the X4 Pro native-SDMMC path.
+  // display, separateSpi=false, BoardConfig.h:887-895) and Sticky's
+  // (STICKY.sd: NO_SDMMC, display.sclk(13) shared with the SD bus,
+  // BoardConfig.h:1311-1320 — Sticky is UNVERIFIED, freeink-sdk's own
+  // "Upcoming Device," so treat this path on it as best-effort pending real
+  // hardware per docs/board-notes/sticky.md), so all three stay on this
+  // pre-claim path like X3/X4, not the X4 Pro native-SDMMC path.
   // PaperS3 and LilyGo T5 S3 also report sdmmc.busWidth == 0 (plain-SPI SD
   // on both) but neither display is SPI at all — both drive their glass
   // over the S3 parallel/i80 bus via LgfxEpd, so
