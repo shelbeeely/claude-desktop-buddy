@@ -1,0 +1,13 @@
+{
+  "name": "Claude Desktop Buddy — Xteink X4",
+  "version": "__VERSION__",
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32-C3",
+      "parts": [
+        { "path": "firmware/xteink_x4.bin", "offset": 0 }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,112 @@
+name: Build & publish Xteink X4 firmware
+
+# Builds the env:xteink_x4 PlatformIO target (see platformio.ini) and, on
+# pushes to main, publishes a flashable image + web installer to GitHub
+# Pages via ESP Web Tools (https://esphome.github.io/esp-web-tools/) —
+# no local toolchain needed to flash a device, just Chrome or Edge over
+# USB (Web Serial).
+#
+# One-time manual step this workflow cannot do for you: in the repo's
+# Settings -> Pages, set "Source" to "GitHub Actions". Until that's set,
+# the deploy job below will fail with a clear error from actions/deploy-pages.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "characters/**"
+      - "platformio.ini"
+      - "freeink-sdk"
+      - "site/**"
+      - ".github/workflows/firmware.yml"
+  pull_request:
+    paths:
+      - "src/**"
+      - "characters/**"
+      - "platformio.ini"
+      - "freeink-sdk"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo (with freeink-sdk submodule)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PlatformIO and esptool
+        # Pinned >=5 for the `merge-bin` (hyphenated) subcommand this
+        # workflow uses; older esptool spelled it `merge_bin`.
+        run: pip install -U platformio "esptool>=5"
+
+      - name: Build env:xteink_x4
+        run: pio run -e xteink_x4
+
+      - name: Merge into one flashable image (bootloader + partitions + boot_app0 + app)
+        # Matches exactly what `pio run -t upload` would write, at the same
+        # offsets, just concatenated into a single file at 0x0 so a browser
+        # flasher only has to write one blob instead of stitching parts —
+        # see README.md "Flashing from the browser" for how these offsets
+        # were confirmed (pio's own planned esptool invocation).
+        run: |
+          BOOT_APP0="$HOME/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin"
+          mkdir -p site/firmware
+          esptool --chip esp32c3 merge-bin \
+            -o site/firmware/xteink_x4.bin \
+            --flash-mode dio --flash-freq 80m --flash-size 16MB \
+            0x0000  .pio/build/xteink_x4/bootloader.bin \
+            0x8000  .pio/build/xteink_x4/partitions.bin \
+            0xe000  "$BOOT_APP0" \
+            0x10000 .pio/build/xteink_x4/firmware.bin
+
+      - name: Write manifest.json (ESP Web Tools)
+        run: |
+          VERSION="$(date -u +%Y.%m.%d)-${GITHUB_SHA::7}"
+          sed "s/__VERSION__/${VERSION}/" site/manifest.template.json > site/manifest.json
+          rm site/manifest.template.json
+          echo "firmware version: ${VERSION}"
+
+      - name: Upload firmware as a build artifact (every push/PR)
+        uses: actions/upload-artifact@v4
+        with:
+          name: xteink_x4-firmware
+          path: |
+            site/firmware/xteink_x4.bin
+            .pio/build/xteink_x4/firmware.bin
+            .pio/build/xteink_x4/bootloader.bin
+            .pio/build/xteink_x4/partitions.bin
+
+      - name: Upload Pages site (main branch only)
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy-pages:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

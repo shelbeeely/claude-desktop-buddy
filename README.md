@@ -178,7 +178,25 @@ Build it with:
 
 ```bash
 pio run -e xteink_x4
+pio run -e xteink_x4 -t upload   # over USB, once built
 ```
+
+### Flashing from the browser
+
+`.github/workflows/firmware.yml` builds this target on every push to `main`
+and publishes it to GitHub Pages as a one-click web installer
+([ESP Web Tools](https://esphome.github.io/esp-web-tools/), Web Serial —
+desktop Chrome or Edge only). The workflow merges the bootloader, partition
+table, `boot_app0`, and app into one image at the offsets `pio run -t
+upload` itself would use (`0x0`/`0x8000`/`0xe000`/`0x10000` for this board's
+`default_16MB.csv` scheme — confirmed by capturing pio's own planned
+`esptool` invocation, not assumed), so the browser only has to write one
+file. The same job also uploads the merged image (and the unmerged parts)
+as a downloadable build artifact on every push and PR, not just `main`.
+
+**One-time setup this workflow can't do for you:** in the repo's **Settings
+→ Pages**, set **Source** to **GitHub Actions**. Until that's set, the
+`deploy-pages` job fails with a clear error rather than silently no-op'ing.
 
 The BLE/protocol/state-machine core (`ble_bridge.cpp/h`, `data.h`, `stats.h`,
 `xfer.h`) is shared with the M5StickCPlus target; only the presentation and
@@ -408,6 +426,13 @@ the same ~295KB of DRAM left after the static image, alongside whatever
   transcript scrollback paging beyond a plain `LEFT`/`RIGHT` scroll — the
   status panel covers session counts, the live approval prompt, and basic
   device status, not a full menu system port.
+- The browser flasher (`site/index.html`) assumes Web Serial can reset the
+  X4 into its ROM bootloader automatically. The X4 uses its native USB
+  port for serial (`ARDUINO_USB_MODE=1`), not a separate USB-UART bridge
+  chip — whether Arduino-ESP32's app-side USB CDC driver answers the reset
+  request the same way a bridge chip would is **not hardware-verified**.
+  The page documents the manual fallback (hold BOOT while plugging in) so
+  flashing still works either way.
 
 ## Availability
 
