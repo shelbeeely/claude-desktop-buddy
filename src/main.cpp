@@ -1,23 +1,26 @@
-// claude-desktop-buddy — Xteink X4 firmware.
+// claude-desktop-buddy — Xteink firmware (X4, X3, X4 Pro).
 //
 // Nordic UART Service BLE bridge (ble_bridge.cpp/h) + JSON wire protocol
 // (data.h, xfer.h) + NVS-backed stats/owner/settings (stats.h) driving a
 // 7-state desk pet rendered on FreeInk (e-paper display, InputManager for
-// the 7-button ADC ladder, BatteryMonitor). sd_character_pack.h/.cpp
-// implements one installed character; main.cpp's characterList[] enumerates
-// the compiled-in bufo plus every SD .charpack found at boot and lets the
+// the button layout, BatteryMonitor). sd_character_pack.h/.cpp implements
+// one installed character; main.cpp's characterList[] enumerates the
+// compiled-in bufo plus every SD .charpack found at boot and lets the
 // settings menu cycle between them — see README.md "SD-backed character
 // packs" and "Menu system".
 //
-// This aims to be as close a match to the earlier M5StickCPlus-based
-// desktop-buddy's UX as this board's hardware allows: same menu/settings/
-// reset structure, same info/pet page layout, same approve/deny-in-a-prompt
-// behavior. Divergences are called out inline and in README.md "Known
-// limitations" — the X4 has no IMU (no shake, no face-down nap detection,
-// no clock orientation), no buzzer, no LED, and no RTC
-// (BoardConfig::XTEINK_X4: NO_SENSORS, NO_AUDIO, NO_LEDS; FREEINK_CAP_RTC's
-// device list excludes X4), so those features are substituted with button
-// gestures or software equivalents rather than ported literally.
+// This one file drives three boards, two of which (X4, X3) share one
+// ESP32-C3 binary (env:xteink) picked at runtime by freeink::
+// selectXteinkDevice() in setup(); the third (X4 Pro) is ESP32-S3 and
+// builds separately (env:xteink_x4pro) but runs the same source. Where a
+// board has real hardware the M5-era original also had (X3's IMU/RTC/
+// battery gauge, X4 Pro's touch/frontlight/RTC/gauge), this file uses it via
+// BoardConfig::hasImu()/hasRtc()/isX4Pro() and the Imu/Rtc/FrontlightManager
+// libraries; where a board has none of it (X4: BoardConfig::XTEINK_X4 is
+// NO_SENSORS/NO_AUDIO/NO_LEDS/NO_FRONTLIGHT, no RTC), the same button/
+// software substitutes from the X4-only version remain. See README.md
+// "Multi-board support" for the full capability matrix, and "Menu system"
+// for what's substituted versus real per board.
 //
 // See README.md for the sprite-region size, the full-refresh timer
 // interval, and the full input mapping.
@@ -33,6 +36,10 @@
 #include <FreeInkUIDisplayTarget.h>
 #include <SDCardManager.h>
 #include <PowerManager.h>
+#include <XteinkDetect.h>
+#include <Imu.h>
+#include <Rtc.h>
+#include <FrontlightManager.h>
 #include <SPI.h>
 
 #include "ble_bridge.h"
@@ -52,29 +59,106 @@ using freeink::ui::TextStyle;
 // Platform hooks required by data.h / xfer.h (see their declarations).
 // ---------------------------------------------------------------------------
 
-// Software clock: no RTC on this board, so we keep one synced moment (from
-// the bridge's "time" heartbeat) plus the millis() it arrived at, and derive
-// "now" by adding elapsed time on every read. Resets on reboot; accurate
+// Wall-clock time. X3 and X4 Pro have a real RTC (BoardConfig::hasRtc());
+// X4 doesn't (FREEINK_CAP_RTC's device list excludes it). Where there's no
+// RTC, we fall back to a software clock: one synced moment (from the
+// bridge's "time" heartbeat) plus the millis() it arrived at, deriving "now"
+// by adding elapsed time on every read — resets on reboot, accurate only
 // while powered. mktime()/gmtime_r() are used purely as a matched pair to
 // add seconds to a struct tm — since both go through the same C library TZ
 // state, the actual TZ setting (unconfigured -> UTC on this core) never
 // matters, only that encode/decode are inverses.
+static freeink::Rtc rtc;
+static bool     rtcAvailable = false;
 static time_t   swClockBase = 0;
 static uint32_t swClockSyncMs = 0;
 static bool     swClockValid = false;
+
+static void rtcBegin() {
+  if (BoardConfig::hasRtc()) rtcAvailable = rtc.begin();
+}
 
 void platformTimeSync(const struct tm& localTime) {
   struct tm lt = localTime;
   swClockBase = mktime(&lt);
   swClockSyncMs = millis();
   swClockValid = true;
+  if (rtcAvailable) {
+    // Write through to the real RTC so time survives a reboot/deep sleep —
+    // the whole point of having one. A write failure just means the next
+    // read falls back to the software clock below (rtc.now() returns false
+    // on I2C error or an unset/stopped oscillator).
+    freeink::Rtc::DateTime dt;
+    dt.year = (uint16_t)(lt.tm_year + 1900);
+    dt.month = (uint8_t)(lt.tm_mon + 1);
+    dt.day = (uint8_t)lt.tm_mday;
+    dt.hour = (uint8_t)lt.tm_hour;
+    dt.minute = (uint8_t)lt.tm_min;
+    dt.second = (uint8_t)lt.tm_sec;
+    dt.weekday = (uint8_t)lt.tm_wday;
+    rtc.set(dt);
+  }
 }
 
 static bool getSoftClock(struct tm& out, uint32_t now) {
+  if (rtcAvailable) {
+    freeink::Rtc::DateTime dt;
+    if (rtc.now(dt)) {
+      out.tm_year = dt.year - 1900;
+      out.tm_mon = dt.month - 1;
+      out.tm_mday = dt.day;
+      out.tm_hour = dt.hour;
+      out.tm_min = dt.minute;
+      out.tm_sec = dt.second;
+      out.tm_wday = dt.weekday;
+      return true;
+    }
+    // Oscillator never set / stopped, or an I2C error — fall through to the
+    // software clock rather than showing nothing.
+  }
   if (!swClockValid) return false;
   time_t t = swClockBase + (time_t)((now - swClockSyncMs) / 1000);
   gmtime_r(&t, &out);
   return true;
+}
+
+// Shake detection. X3 has a real QMI8658 IMU (BoardConfig::hasImu()); X4 and
+// X4 Pro don't (X4: NO_SENSORS; X4 Pro: also no IMU despite its touch/
+// frontlight/RTC/gauge — confirmed via BoardConfig, not assumed), so those
+// boards keep the DOWN-hold substitute in handleInput() regardless. Where a
+// real IMU is present this runs alongside DOWN-hold, not instead of it —
+// every button keeps doing the same thing on every board; the sensor is
+// just an additional, more literal way to trigger the same dizzy state.
+static freeink::Imu imu;
+static bool  imuAvailable = false;
+static float shakeBaseline = 1.0f;
+
+static void imuBegin() {
+  if (BoardConfig::hasImu()) imuAvailable = imu.begin();
+}
+
+static bool checkShake() {
+  if (!imuAvailable) return false;
+  freeink::Imu::Sample s;
+  if (!imu.read(s)) return false;
+  float mag = sqrtf(s.ax * s.ax + s.ay * s.ay + s.az * s.az);
+  float delta = fabsf(mag - shakeBaseline);
+  shakeBaseline = shakeBaseline * 0.95f + mag * 0.05f;
+  return delta > 0.8f;
+}
+
+// Frontlight. Only X4 Pro has one (BoardConfig::hasFrontlight() equivalent
+// is FrontlightManager::present(), checked at runtime since it also covers
+// the warm/cool-pair vs single-channel split) — inert everywhere else, so
+// it's always safe to construct and call begin() on unconditionally.
+static FrontlightManager frontlight;
+// 0..4 -> 20..100%, same 5-step scale as the earlier M5-era generation's
+// brightness setting (there: M5.Axp.ScreenBreath). Session-only, matching
+// that generation's choice not to persist it either.
+static uint8_t brightLevel = 4;
+static void cycleBrightness() {
+  brightLevel = (brightLevel + 1) % 5;
+  frontlight.setBrightness((uint8_t)(20 + brightLevel * 20));
 }
 
 BatteryMonitor batteryMonitor;
@@ -83,19 +167,26 @@ PlatformBatteryStatus platformBatteryStatus() {
   PlatformBatteryStatus out{0, 0, 0, false};
   if (s.percentageKnown) out.pct = s.percentage;
   if (s.millivoltsKnown) out.mV = s.millivolts;
-  // X4 has no charge-status pin (BoardConfig::XTEINK_X4.batteryChargeStatus
-  // == PIN_UNASSIGNED), so BatteryMonitor can't report charging/mA. usbDetect
-  // (GPIO20) IS wired on the profile; we read it directly here since nothing
-  // in the SDK's ADC battery backend consumes it. Polarity (active-high) is
-  // an assumption, NOT hardware-validated — flagged in README "Known
-  // limitations". The X4 Pro reverse-engineering doc explicitly notes its
-  // own VBUS/USB pin was "not conclusively identified" even after a
-  // hardware RE session, so treat this the same way until someone confirms
-  // it on a scope.
-  if (BoardConfig::ACTIVE.usbDetect != BoardConfig::PIN_UNASSIGNED) {
+  // X3's BQ27220 and X4 Pro's CW2017 gauges report real percentage/voltage
+  // over I2C (BatteryMonitor picks gauge vs. ADC at runtime from
+  // BoardConfig::ACTIVE.batteryGauge — no board-specific code needed here).
+  // Charging isn't observable from either gauge though (no charger IC on
+  // their bus — confirmed for X4 Pro's CW2017 in freeink-sdk/docs/
+  // xteink-x4pro-support.md "RTC / USB / battery"; X3 untested, assumed the
+  // same), and Status doesn't expose a magnitude even when chargingKnown is
+  // true, so -1 here just means "charging, current unknown" per
+  // REFERENCE.md's "negative = charging" contract.
+  if (s.chargingKnown) out.mA = s.charging ? -1 : 0;
+  if (s.externalPowerKnown) {
+    out.usb = s.externalPower;
+  } else if (BoardConfig::ACTIVE.usbDetect != BoardConfig::PIN_UNASSIGNED) {
+    // X4 has no charge-status pin (BoardConfig::XTEINK_X4.batteryChargeStatus
+    // == PIN_UNASSIGNED) and its ADC battery backend never sets
+    // externalPowerKnown, so this reads usbDetect (GPIO20) directly.
+    // Polarity (active-high) is an assumption, NOT hardware-validated —
+    // flagged in README "Known limitations".
     out.usb = digitalRead(BoardConfig::ACTIVE.usbDetect) == HIGH;
   }
-  out.mA = 0;  // unknown — no current sense on this board
   return out;
 }
 
@@ -127,12 +218,16 @@ static void triggerOneShot(PersonaState s, uint32_t durMs) {
 // ---------------------------------------------------------------------------
 // Display + sprite region.
 //
-// Panel: 800x480. bufo's Icon assets top out at bufo::MAX_ICON_W x
-// MAX_ICON_H = 192x200 (96px source x 2 scale — see tools/gif_to_icons.py
-// and README "Asset pipeline"). SPRITE region is sized with margin around
-// that and kept byte-aligned (x and w multiples of 8) so the manual
-// framebuffer inversion used for the `attention` cue below never touches a
-// partial byte at the edges.
+// Panel: 800x480 on X4/X4 Pro, 792x528 on X3 (BoardConfig::ACTIVE picks the
+// real dimensions at runtime — see "Multi-board support" below). bufo's Icon
+// assets top out at bufo::MAX_ICON_W x MAX_ICON_H = 192x200 (96px source x 2
+// scale — see tools/gif_to_icons.py and README "Asset pipeline"). SPRITE
+// region is sized with margin around that and kept byte-aligned (x and w
+// multiples of 8) so the manual framebuffer inversion used for the
+// `attention` cue below never touches a partial byte at the edges — that
+// margin comfortably fits either panel, so it stays a fixed size across
+// boards; only the panel-relative layout below (PANEL_W, full-screen
+// overlays) reads the runtime panel size.
 // ---------------------------------------------------------------------------
 static constexpr int16_t SPRITE_X = 40;
 static constexpr int16_t SPRITE_Y = 40;
@@ -141,10 +236,15 @@ static constexpr int16_t SPRITE_H = 260;
 static_assert(SPRITE_W >= bufo::MAX_ICON_W && SPRITE_H >= bufo::MAX_ICON_H,
               "sprite region must fit the largest generated icon");
 
-// Text/status panel occupies the rest of the 800x480 panel to the right of
-// (and below) the sprite region.
+// Text/status panel occupies the rest of the panel to the right of (and
+// below) the sprite region. PANEL_TOTAL_W/H and PANEL_W are set once in
+// setup() from display.getDisplayWidth()/Height() once the real board is
+// known (see freeink::selectXteinkDevice() there) — X3's panel is a
+// different size than X4/X4 Pro's, so these can't be compile-time constants.
 static constexpr int16_t PANEL_X = SPRITE_X + SPRITE_W + 24;
-static constexpr int16_t PANEL_W = 800 - PANEL_X - 16;
+static int16_t PANEL_TOTAL_W = 800;
+static int16_t PANEL_TOTAL_H = 480;
+static int16_t PANEL_W = PANEL_TOTAL_W - PANEL_X - 16;
 
 EInkDisplay display(BoardConfig::ACTIVE.display.sclk, BoardConfig::ACTIVE.display.mosi,
                     BoardConfig::ACTIVE.display.cs, BoardConfig::ACTIVE.display.dc,
@@ -435,8 +535,14 @@ static constexpr uint8_t MENU_N = 6;
 
 static bool    settingsOpen = false;
 static uint8_t settingsSel = 0;
-static const char* const settingsItems[] = {"hud", "flash", "character", "reset", "back"};
-static constexpr uint8_t SETTINGS_N = 5;
+// "brightness" only makes sense on a board with a frontlight (X4 Pro) — the
+// item list and count are picked once in setup() from frontlight.present(),
+// per README "Menu system".
+static const char* const SETTINGS_ITEMS_BASE[] = {"hud", "flash", "character", "reset", "back"};
+static const char* const SETTINGS_ITEMS_LIGHT[] = {"hud", "flash", "character", "brightness", "reset", "back"};
+static const char* const* settingsItems = SETTINGS_ITEMS_BASE;
+static uint8_t SETTINGS_N = 5;
+static bool    hasBrightnessItem = false;
 
 static bool     resetOpen = false;
 static uint8_t  resetSel = 0;
@@ -470,7 +576,7 @@ static bool clockActive() {
   bool inPrompt = tama.promptId[0] && !responseSent;
   return displayMode == DISP_NORMAL && !overlayOpen && !inPrompt
       && tama.sessionsRunning == 0 && tama.sessionsWaiting == 0
-      && swClockValid && platformBatteryStatus().usb;
+      && (rtcAvailable || swClockValid) && platformBatteryStatus().usb;
 }
 
 // Hour-conditioned mood table shown while the clock face is active — direct
@@ -518,7 +624,7 @@ static void drawPetPage(uint32_t now, int16_t y) {
   char b[48];
   if (ownerName()[0]) snprintf(b, sizeof(b), "%s's %s", ownerName(), petName());
   else snprintf(b, sizeof(b), "%s", petName());
-  ui().text(Rect{PANEL_X, y, PANEL_W - 60, 24}, b, TextStyle{0, TextAlign::Left, Color::Black, 1, true, false});
+  ui().text(Rect{PANEL_X, y, (int16_t)(PANEL_W - 60), 24}, b, TextStyle{0, TextAlign::Left, Color::Black, 1, true, false});
   snprintf(b, sizeof(b), "%u/%u", petPage + 1, PET_PAGES);
   ui().text(Rect{(int16_t)(PANEL_X + PANEL_W - 60), y, 60, 24}, b,
             TextStyle{0, TextAlign::Right, Color::DarkGray, 1, false, false});
@@ -666,14 +772,14 @@ static void drawInfoPage(uint32_t now, int16_t y) {
     ln(Color::Black, "/claude-desktop-buddy");
     y += 8;
     ln(Color::DarkGray, "hardware");
-    ln(Color::Black, "Xteink X4");
-    ln(Color::Black, "ESP32-C3 + SSD1677");
+    ln(Color::Black, BoardConfig::ACTIVE.name);
+    ln(Color::Black, BoardConfig::isX4Pro() ? "ESP32-S3" : "ESP32-C3");
   }
 }
 
 static void drawPanelBox(int16_t& boxX, int16_t& boxY, int16_t boxW, int16_t boxH) {
-  boxX = (int16_t)((800 - boxW) / 2);
-  boxY = (int16_t)((480 - boxH) / 2);
+  boxX = (int16_t)((PANEL_TOTAL_W - boxW) / 2);
+  boxY = (int16_t)((PANEL_TOTAL_H - boxH) / 2);
   ui().fill(Rect{boxX, boxY, boxW, boxH}, Paint::solid(Color::White), 10);
   ui().stroke(Rect{boxX, boxY, boxW, boxH}, Paint::solid(Color::Black), 2, 10);
 }
@@ -719,6 +825,7 @@ static void drawSettings() {
     if (i == 0) value = s.hud ? "on" : "off";
     else if (i == 1) value = s.flash ? "on" : "off";
     else if (i == 2) { snprintf(valbuf, sizeof(valbuf), "%u/%u", characterIdx + 1, characterCount); value = valbuf; }
+    else if (hasBrightnessItem && i == 3) { snprintf(valbuf, sizeof(valbuf), "%u/5", brightLevel + 1); value = valbuf; }
     drawMenuItem((int16_t)(boxX + 12), y, (int16_t)(boxW - 24), settingsItems[i], value, i == settingsSel);
     y += 30;
   }
@@ -740,14 +847,16 @@ static void drawReset(uint32_t now) {
 }
 
 static void drawPasskey() {
-  ui().fill(Rect{0, 0, 800, 480}, Paint::solid(Color::White));
-  ui().text(Rect{0, 160, 800, 24}, "BLUETOOTH PAIRING",
+  ui().fill(Rect{0, 0, PANEL_TOTAL_W, PANEL_TOTAL_H}, Paint::solid(Color::White));
+  int16_t midY = (int16_t)(PANEL_TOTAL_H / 2);
+  ui().text(Rect{0, (int16_t)(midY - 80), PANEL_TOTAL_W, 24}, "BLUETOOTH PAIRING",
             TextStyle{0, TextAlign::Center, Color::DarkGray, 1, false, false});
-  ui().text(Rect{0, 280, 800, 24}, "enter on desktop:",
+  ui().text(Rect{0, (int16_t)(midY + 40), PANEL_TOTAL_W, 24}, "enter on desktop:",
             TextStyle{0, TextAlign::Center, Color::DarkGray, 1, false, false});
   char b[8];
   snprintf(b, sizeof(b), "%06lu", (unsigned long)blePasskey());
-  ui().text(Rect{0, 210, 800, 40}, b, TextStyle{0, TextAlign::Center, Color::Black, 1, true, false});
+  ui().text(Rect{0, (int16_t)(midY - 30), PANEL_TOTAL_W, 40}, b,
+            TextStyle{0, TextAlign::Center, Color::Black, 1, true, false});
 }
 
 static void drawStatusPanel(uint32_t now) {
@@ -759,7 +868,7 @@ static void drawStatusPanel(uint32_t now) {
     return;
   }
 
-  ui().fill(Rect{PANEL_X, 0, PANEL_W, 480}, Paint::solid(Color::White));
+  ui().fill(Rect{PANEL_X, 0, PANEL_W, PANEL_TOTAL_H}, Paint::solid(Color::White));
 
   int16_t y = 12;
   char line[96];
@@ -784,10 +893,10 @@ static void drawStatusPanel(uint32_t now) {
     y += 28;
     ui().text(Rect{PANEL_X, y, PANEL_W, 40}, tama.promptHint, TextStyle{0, TextAlign::Left, Color::DarkGray, 2, false, false});
     y += 44;
-    ui().text(Rect{PANEL_X, y, PANEL_W / 2, 20}, "CONFIRM: approve",
+    ui().text(Rect{PANEL_X, y, (int16_t)(PANEL_W / 2), 20}, "CONFIRM: approve",
             TextStyle{0, TextAlign::Left, Color::Black, 1, false, false});
     y += 22;
-    ui().text(Rect{PANEL_X, y, PANEL_W / 2, 20}, "BACK: deny", TextStyle{0, TextAlign::Left, Color::Black, 1, false, false});
+    ui().text(Rect{PANEL_X, y, (int16_t)(PANEL_W / 2), 20}, "BACK: deny", TextStyle{0, TextAlign::Left, Color::Black, 1, false, false});
     y += 28;
   } else if (clockActive()) {
     drawClock(now, y);
@@ -825,7 +934,8 @@ static void drawStatusPanel(uint32_t now) {
     }
   }
 
-  y = 340;
+  y = (int16_t)(PANEL_TOTAL_H - 140);  // bottom-anchored so it stays clear of the
+                                        // content above regardless of panel height
   PlatformBatteryStatus bat = platformBatteryStatus();
   snprintf(line, sizeof(line), "battery %d%%  %s", bat.pct, bat.usb ? "usb" : "");
   ui().text(Rect{PANEL_X, y, PANEL_W, 20}, line, TextStyle{0, TextAlign::Left, Color::DarkGray, 1, false, false});
@@ -849,8 +959,8 @@ static void drawStatusPanel(uint32_t now) {
 // menuConfirm()/applySetting()/applyReset().
 // ---------------------------------------------------------------------------
 static void powerOffSequence() {
-  ui().fill(Rect{0, 0, 800, 480}, Paint::solid(Color::White));
-  ui().text(Rect{0, 220, 800, 40}, "powered off - press POWER",
+  ui().fill(Rect{0, 0, PANEL_TOTAL_W, PANEL_TOTAL_H}, Paint::solid(Color::White));
+  ui().text(Rect{0, (int16_t)(PANEL_TOTAL_H / 2 - 20), PANEL_TOTAL_W, 40}, "powered off - press POWER",
             TextStyle{0, TextAlign::Center, Color::DarkGray, 1, false, false});
   display.displayBuffer(EInkDisplay::FULL_REFRESH);
   // No PMIC hard-off on this board (the earlier generation's
@@ -872,12 +982,23 @@ static void menuConfirm() {
 
 static void applySetting(uint8_t idx) {
   Settings& s = settings();
-  switch (idx) {
-    case 0: s.hud = !s.hud; break;
-    case 1: s.flash = !s.flash; break;
-    case 2: nextCharacter(); return;
-    case 3: resetOpen = true; resetSel = 0; resetConfirmIdx = 0xFF; return;
-    case 4: settingsOpen = false; return;
+  if (hasBrightnessItem) {
+    switch (idx) {
+      case 0: s.hud = !s.hud; break;
+      case 1: s.flash = !s.flash; break;
+      case 2: nextCharacter(); return;
+      case 3: cycleBrightness(); return;
+      case 4: resetOpen = true; resetSel = 0; resetConfirmIdx = 0xFF; return;
+      case 5: settingsOpen = false; return;
+    }
+  } else {
+    switch (idx) {
+      case 0: s.hud = !s.hud; break;
+      case 1: s.flash = !s.flash; break;
+      case 2: nextCharacter(); return;
+      case 3: resetOpen = true; resetSel = 0; resetConfirmIdx = 0xFF; return;
+      case 4: settingsOpen = false; return;
+    }
   }
   settingsSave();
 }
@@ -920,8 +1041,8 @@ static void applyReset(uint8_t idx, uint32_t now) {
 // ---------------------------------------------------------------------------
 static void sleepScreen(uint32_t now) {
   screenAwake = false;
-  ui().fill(Rect{0, 0, 800, 480}, Paint::solid(Color::White));
-  ui().text(Rect{0, 220, 800, 40}, "sleeping - press any button",
+  ui().fill(Rect{0, 0, PANEL_TOTAL_W, PANEL_TOTAL_H}, Paint::solid(Color::White));
+  ui().text(Rect{0, (int16_t)(PANEL_TOTAL_H / 2 - 20), PANEL_TOTAL_W, 40}, "sleeping - press any button",
             TextStyle{0, TextAlign::Center, Color::DarkGray, 1, false, false});
   display.displayBuffer(EInkDisplay::FULL_REFRESH);
   lastFullRefreshMs = now;
@@ -1069,9 +1190,12 @@ static void handleInput(uint32_t now) {
   if (!screenAwake) {
     // Any press just wakes the screen — never doubles as that button's
     // normal action, so a CONFIRM that wakes the device can't also
-    // silently approve a prompt the user hasn't seen yet.
+    // silently approve a prompt the user hasn't seen yet. wasHomeKeyPressed()
+    // covers X4 Pro's capacitive Home key, which — unlike every other
+    // button — never enters the popPress() queue (see the BACK-dispatch
+    // comment below); inert (returns false) on boards without touch.
     uint8_t btn;
-    bool anyPress = false;
+    bool anyPress = input.wasHomeKeyPressed();
     while (input.popPress(btn)) anyPress = true;
     if (anyPress) wakeScreen(now);
     confirmHold = HoldButton{};
@@ -1080,9 +1204,36 @@ static void handleInput(uint32_t now) {
     return;
   }
 
+  // Real shake, on boards with an IMU (see checkShake() above). Gated on
+  // !overlayOpen/!napping to match the earlier M5-era generation's own
+  // !menuOpen/!screenOff gate — a shake mid-menu-navigation or mid-nap
+  // shouldn't interrupt either.
+  static uint32_t lastShakeCheckMs = 0;
+  if (imuAvailable && !overlayOpen && !napping && now - lastShakeCheckMs > 50) {
+    lastShakeCheckMs = now;
+    if (checkShake() && (int32_t)(now - oneShotUntil) >= 0) {
+      triggerOneShot(P_DIZZY, 2000);
+    }
+  }
+
   // BACK/LEFT/RIGHT/POWER: plain press-edge actions, no hold behavior.
   // CONFIRM/UP/DOWN edges are drained here too (silently — they're handled
   // below via level-polling so tap and hold can be told apart).
+  //
+  // X4 Pro has no physical BACK — its profile's input.back is PIN_UNASSIGNED
+  // (confirmed via BoardConfig; see README "Multi-board support"), and
+  // unlike every other button, the capacitive Home key does NOT synthesize
+  // into the BTN_* system InputManager::popPress() drains — it's its own
+  // API (wasHomeKeyTapped()/wasHomeKeyPressed()/wasHomeKeyLongPressed()).
+  // wasHomeKeyTapped() also has no LEFT/RIGHT equivalent to fall back on
+  // (X4 Pro's own input.left/right are PIN_UNASSIGNED too — its two
+  // physical nav buttons wire to the semantic UP/DOWN slots instead, per
+  // its BoardConfig profile), so a Home-key tap is the only way BACK
+  // happens on this board; wire it to the same dispatchBack() every other
+  // board's physical BACK button calls. Inert (returns false) on boards
+  // without touch.
+  if (input.wasHomeKeyTapped()) dispatchBack(now);
+
   uint8_t btn;
   while (input.popPress(btn)) {
     if (btn == InputManager::BTN_BACK) {
@@ -1126,6 +1277,21 @@ void setup() {
   settingsLoad();
   petNameLoad();
 
+  // Multi-board support: env:xteink links both the X4 (SSD1677 800x480) and
+  // X3 (UC8253/UC8279 792x528) profiles into one ESP32-C3 binary — this is
+  // the SDK's own documented pattern (freeink-sdk README "Supported
+  // devices"), not something specific to this firmware. selectXteinkDevice()
+  // I2C-fingerprints the X3-only peripherals (BQ27220 gauge, DS3231 RTC,
+  // QMI8658 IMU) and, on a match, both switches BoardConfig::ACTIVE to the
+  // X3 profile and (via setDisplayX3() below) tells the display driver which
+  // panel it's driving — everything downstream (BatteryMonitor, Imu, Rtc,
+  // this file's own PANEL_TOTAL_W/H) then reads the correct board
+  // automatically. On env:xteink_x4pro (a separate ESP32-S3 build — X4 Pro
+  // is a different MCU family, can't share this binary) this call is a
+  // documented no-op. Must run before SdMan.begin()/display.begin().
+  bool isX3 = freeink::selectXteinkDevice();
+  if (isX3) display.setDisplayX3();
+
   // X3/X4 share the display's SPI bus with the SD card slot (BoardConfig::
   // XTEINK_X4.sd: sclk/mosi unassigned, separateSpi=false — miso(7) and
   // cs(12) are the only pins unique to the card). FreeInkDisplay::begin()
@@ -1137,10 +1303,18 @@ void setup() {
   // Claiming it once here, with the SD MISO included, before display.begin()
   // runs its own SPI.begin(), is exactly the sequence Free-Ink's own X4
   // consumer app (inkdeck, src/main.cpp setup()) uses for this same board.
-  SPI.begin(BoardConfig::ACTIVE.display.sclk, BoardConfig::ACTIVE.sd.miso, BoardConfig::ACTIVE.display.mosi,
-            BoardConfig::ACTIVE.display.cs);
+  // X4 Pro doesn't need this: its SD card is native SDMMC on entirely
+  // separate pins (CLK41/CMD42/DAT40), not a shared SPI bus — see
+  // freeink-sdk/docs/xteink-x4pro-support.md "Storage".
+  if (!BoardConfig::isX4Pro()) {
+    SPI.begin(BoardConfig::ACTIVE.display.sclk, BoardConfig::ACTIVE.sd.miso, BoardConfig::ACTIVE.display.mosi,
+              BoardConfig::ACTIVE.display.cs);
+  }
 
   display.begin();
+  PANEL_TOTAL_W = display.getDisplayWidth();
+  PANEL_TOTAL_H = display.getDisplayHeight();
+  PANEL_W = (int16_t)(PANEL_TOTAL_W - PANEL_X - 16);
   uiPtr = new (uiStorage) DisplayTarget(display.getFrameBuffer(), display.getDisplayWidth(),
                                         display.getDisplayHeight(), display.getDisplayWidthBytes(),
                                         Orientation::LandscapeCounterClockwise);
@@ -1151,6 +1325,16 @@ void setup() {
   SdMan.begin();  // false if no card present — scanCharacters() below no-ops either way
   scanCharacters();
   applyCharacter(characterIdxLoad());
+
+  imuBegin();
+  rtcBegin();
+  frontlight.begin();
+  if (frontlight.present()) {
+    settingsItems = SETTINGS_ITEMS_LIGHT;
+    SETTINGS_N = 6;
+    hasBrightnessItem = true;
+    frontlight.setBrightness((uint8_t)(20 + brightLevel * 20));  // apply the default brightLevel=4 (100%)
+  }
 
   input.begin();
   input.beginAsync();  // see handleInput()'s comment for why this is required
@@ -1231,8 +1415,8 @@ void loop() {
     static uint32_t lastPanelDrawMs = 0;
     bool due = needsRedraw || (now - lastPanelDrawMs > 1000);
     if (due) {
-      if (overlayOpen) display.displayWindow(0, 0, 800, 480);
-      else display.displayWindow(PANEL_X, 0, 800 - PANEL_X, 480);
+      if (overlayOpen) display.displayWindow(0, 0, PANEL_TOTAL_W, PANEL_TOTAL_H);
+      else display.displayWindow(PANEL_X, 0, PANEL_TOTAL_W - PANEL_X, PANEL_TOTAL_H);
       lastPanelDrawMs = now;
       needsRedraw = false;
     }

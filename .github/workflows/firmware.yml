@@ -1,10 +1,13 @@
-name: Build & publish Xteink X4 firmware
+name: Build & publish Xteink firmware
 
-# Builds the env:xteink_x4 PlatformIO target (see platformio.ini) and, on
-# pushes to main, publishes a flashable image + web installer to GitHub
-# Pages via ESP Web Tools (https://esphome.github.io/esp-web-tools/) —
-# no local toolchain needed to flash a device, just Chrome or Edge over
-# USB (Web Serial).
+# Builds env:xteink (X4 + X3, one ESP32-C3 binary) and env:xteink_x4pro
+# (ESP32-S3) — see platformio.ini and README.md "Multi-board support" — and,
+# on pushes to main, publishes both as flashable images + one web installer
+# to GitHub Pages via ESP Web Tools (https://esphome.github.io/esp-web-tools/,
+# no local toolchain needed to flash a device, just Chrome or Edge over USB /
+# Web Serial). The manifest carries both chip families in one "builds" array;
+# ESP Web Tools auto-selects the entry matching whichever board is actually
+# connected, so the page needs only one Install button for both.
 #
 # One-time manual step this workflow cannot do for you: in the repo's
 # Settings -> Pages, set "Source" to "GitHub Actions". Until that's set,
@@ -53,25 +56,44 @@ jobs:
         # workflow uses; older esptool spelled it `merge_bin`.
         run: pip install -U platformio "esptool>=5"
 
-      - name: Build env:xteink_x4
-        run: pio run -e xteink_x4
+      - name: Build env:xteink (X4 + X3, ESP32-C3)
+        run: pio run -e xteink
 
-      - name: Merge into one flashable image (bootloader + partitions + boot_app0 + app)
-        # Matches exactly what `pio run -t upload` would write, at the same
-        # offsets, just concatenated into a single file at 0x0 so a browser
-        # flasher only has to write one blob instead of stitching parts —
-        # see README.md "Flashing from the browser" for how these offsets
-        # were confirmed (pio's own planned esptool invocation).
+      - name: Merge env:xteink into one flashable image
+        # Matches exactly what `pio run -e xteink -t upload` would write, at
+        # the same offsets, just concatenated into a single file at 0x0 so a
+        # browser flasher only has to write one blob instead of stitching
+        # parts — see README.md "Flashing from the browser" for how these
+        # offsets were confirmed (pio's own planned esptool invocation).
         run: |
           BOOT_APP0="$HOME/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin"
           mkdir -p site/firmware
           esptool --chip esp32c3 merge-bin \
-            -o site/firmware/xteink_x4.bin \
+            -o site/firmware/xteink.bin \
             --flash-mode dio --flash-freq 80m --flash-size 16MB \
-            0x0000  .pio/build/xteink_x4/bootloader.bin \
-            0x8000  .pio/build/xteink_x4/partitions.bin \
+            0x0000  .pio/build/xteink/bootloader.bin \
+            0x8000  .pio/build/xteink/partitions.bin \
             0xe000  "$BOOT_APP0" \
-            0x10000 .pio/build/xteink_x4/firmware.bin
+            0x10000 .pio/build/xteink/firmware.bin
+
+      - name: Build env:xteink_x4pro (X4 Pro, ESP32-S3)
+        run: pio run -e xteink_x4pro
+
+      - name: Merge env:xteink_x4pro into one flashable image
+        # Same recipe as env:xteink above, different chip — the offsets
+        # (0x0/0x8000/0xe000/0x10000) are identical between esp32c3 and
+        # esp32s3 in this Arduino core; confirmed via `pio run -e
+        # xteink_x4pro -t upload -v`'s own planned esptool invocation, not
+        # assumed from the C3 build alone.
+        run: |
+          BOOT_APP0="$HOME/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin"
+          esptool --chip esp32s3 merge-bin \
+            -o site/firmware/xteink_x4pro.bin \
+            --flash-mode dio --flash-freq 80m --flash-size 16MB \
+            0x0000  .pio/build/xteink_x4pro/bootloader.bin \
+            0x8000  .pio/build/xteink_x4pro/partitions.bin \
+            0xe000  "$BOOT_APP0" \
+            0x10000 .pio/build/xteink_x4pro/firmware.bin
 
       - name: Write manifest.json (ESP Web Tools)
         run: |
@@ -83,12 +105,16 @@ jobs:
       - name: Upload firmware as a build artifact (every push/PR)
         uses: actions/upload-artifact@v4
         with:
-          name: xteink_x4-firmware
+          name: xteink-firmware
           path: |
-            site/firmware/xteink_x4.bin
-            .pio/build/xteink_x4/firmware.bin
-            .pio/build/xteink_x4/bootloader.bin
-            .pio/build/xteink_x4/partitions.bin
+            site/firmware/xteink.bin
+            site/firmware/xteink_x4pro.bin
+            .pio/build/xteink/firmware.bin
+            .pio/build/xteink/bootloader.bin
+            .pio/build/xteink/partitions.bin
+            .pio/build/xteink_x4pro/firmware.bin
+            .pio/build/xteink_x4pro/bootloader.bin
+            .pio/build/xteink_x4pro/partitions.bin
 
       - name: Upload Pages site (main branch only)
         if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'

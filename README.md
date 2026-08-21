@@ -18,58 +18,143 @@ and lets you approve or deny right from the device.
 
 ## Hardware
 
-The firmware targets the **[Xteink X4](https://github.com/Free-Ink/freeink-sdk)**
-(ESP32-C3, SSD1677 800×480 e-paper, no PSRAM) via the FreeInk SDK, vendored
-as the `freeink-sdk` git submodule (`git submodule update --init` before
-building). A few things about this board shape the firmware:
+The firmware targets three **[Xteink](https://github.com/Free-Ink/freeink-sdk)**
+boards via the FreeInk SDK, vendored as the `freeink-sdk` git submodule
+(`git submodule update --init` before building):
+
+| | X4 | X3 | X4 Pro |
+|---|---|---|---|
+| MCU | ESP32-C3 | ESP32-C3 | ESP32-S3 (PSRAM) |
+| Panel | SSD1677, 800×480 | UC8253/UC8279d, 792×528 | SSD1677/UC8179/UC8279, 800×480 |
+| Input | 7-button ADC ladder | 7-button ADC ladder | 2 digital nav buttons + GT911 touch |
+| IMU | none | QMI8658 | none |
+| RTC | none | DS3231 | BM8563 |
+| Battery | ADC estimate | BQ27220 gauge | CW2017 gauge |
+| Frontlight | none | none | dual warm/cool PWM |
+| Build | `env:xteink` | `env:xteink` | `env:xteink_x4pro` |
+
+X4 and X3 share the ESP32-C3 and a pinout, so **one binary drives both** —
+this is the FreeInk SDK's own documented pattern (its README's "Supported
+devices" table), not something specific to this firmware. See "Multi-board
+support" below for how `main.cpp` adapts to whichever board actually
+booted. X4 Pro is a different MCU family entirely and builds as its own
+target.
+
+A few things about the ESP32-C3 boards (X4/X3) shape parts of the firmware
+regardless of which one is running:
 
 - **Seven-button ADC ladder, not a handful of discrete GPIOs.**
-  `BoardConfig::XTEINK_X4` declares `InputStyle::XteinkAdcLadder`: two ADC
-  pins, each a resistor ladder multiplexing several buttons, decoding to
-  seven semantic buttons — `BACK`, `CONFIRM`, `LEFT`, `RIGHT`, `UP`, `DOWN`,
-  `POWER`. `InputManager::getState()` handles the decode; the firmware
-  always routes through this semantic API, never raw `analogRead()`
-  thresholds.
-- **No IMU, no RTC.** `BoardConfig::XTEINK_X4`'s `sensors` field is
-  `NO_SENSORS`, and it's absent from `FREEINK_CAP_RTC`'s device list. There's
-  no shake gesture, no face-down detection, and no wall-clock time that
-  survives a reboot.
-- **Battery is ADC-only.** `batteryChargeStatus` is `PIN_UNASSIGNED` — no
-  charge-current sensing, so charge current always reads `0`. A real
-  `usbDetect` pin (GPIO20) reports external power, read directly since
-  `BatteryMonitor`'s ADC backend doesn't surface it.
-- **The SD card slot shares the display's SPI bus** (`BoardConfig::XTEINK_X4.sd`:
-  `sclk`/`mosi` unassigned, `separateSpi=false` — only `miso` (GPIO7) and
-  `cs` (GPIO12) are unique to the card). `FreeInkDisplay::begin()` only wires
-  MISO into the bus when the panel driver needs it, which SSD1677 doesn't —
-  so `setup()` claims the SPI bus once, MISO included, before
-  `display.begin()` runs its own `SPI.begin()`. This is the same sequence
-  [Free-Ink's own X4 app, inkdeck](https://github.com/Free-Ink/inkdeck/blob/main/src/main.cpp),
-  uses for the same board.
+  `InputStyle::XteinkAdcLadder`: two ADC pins, each a resistor ladder
+  multiplexing several buttons, decoding to seven semantic buttons —
+  `BACK`, `CONFIRM`, `LEFT`, `RIGHT`, `UP`, `DOWN`, `POWER`.
+  `InputManager::getState()` handles the decode; the firmware always
+  routes through this semantic API, never raw `analogRead()` thresholds.
+  X4 Pro uses a different input style — see "Multi-board support".
+- **The SD card slot shares the display's SPI bus** (`sclk`/`mosi`
+  unassigned, `separateSpi=false` — only `miso` (GPIO7) and `cs` (GPIO12)
+  are unique to the card). `FreeInkDisplay::begin()` only wires MISO into
+  the bus when the panel driver needs it, which none of X4/X3's panel
+  controllers do — so `setup()` claims the SPI bus once, MISO included,
+  before `display.begin()` runs its own `SPI.begin()`. This is the same
+  sequence [Free-Ink's own X4 app, inkdeck](https://github.com/Free-Ink/inkdeck/blob/main/src/main.cpp),
+  uses for the same board. X4 Pro's SD card is native SDMMC on entirely
+  separate pins, so it skips this claim — see "Multi-board support".
+
+## Multi-board support
+
+`main.cpp` is one file for all three boards. Where a board has real
+hardware, the firmware uses it; where it doesn't, the same button/software
+substitute from the original X4-only version remains — nothing is board-
+specific by `#ifdef`, it's all runtime checks (`BoardConfig::hasImu()`,
+`hasRtc()`, `isX4Pro()`, `FrontlightManager::present()`), so one binary
+(X4/X3) or one shared source file (X4 Pro) can serve every capability
+level without duplicating logic:
+
+- **X3 vs. X4 detection.** `freeink::selectXteinkDevice()` (`main.cpp`
+  `setup()`, before any display/SD bring-up) I2C-fingerprints X3-only
+  peripherals (BQ27220 gauge, DS3231 RTC, QMI8658 IMU) on a shared probe
+  bus. A match switches `BoardConfig::ACTIVE` to the X3 profile and calls
+  `display.setDisplayX3()`; everything downstream — panel size
+  (`PANEL_TOTAL_W`/`H`, read from `display.getDisplayWidth()`/`Height()`
+  rather than hardcoded, since X3's panel is a different size than X4's),
+  `BatteryMonitor`, `Imu`, `Rtc` — then reads the correct board
+  automatically. A no-op on `env:xteink_x4pro` (X4 Pro is a different MCU
+  family; the function's I2C probe is C3-pinout-specific and would be
+  unsafe there, so it's compiled out).
+- **Shake → `dizzy`.** On X3 (`BoardConfig::hasImu()`), a real accelerometer
+  reading (rolling-baseline magnitude delta, same idea as the earlier
+  M5-era generation's shake detection) triggers `dizzy` directly, running
+  alongside — not instead of — the `DOWN`-held button substitute every
+  board keeps. X4 and X4 Pro have no IMU, so only the button works there.
+- **Clock face.** On X3 and X4 Pro (`BoardConfig::hasRtc()`), the `Rtc`
+  library reads real wall-clock time that survives a reboot, and
+  `platformTimeSync()` writes through to it on every bridge sync so it
+  stays accurate. X4 has no RTC and falls back to the RAM-only software
+  clock described in "Menu system" below — `getSoftClock()` tries the real
+  RTC first and only falls back when there isn't one (or a read fails).
+- **Battery.** `BatteryMonitor` already picks ADC (X4) vs. I2C fuel gauge
+  (X3's BQ27220, X4 Pro's CW2017) at runtime from
+  `BoardConfig::ACTIVE.batteryGauge` — `platformBatteryStatus()` needed no
+  board-specific code, just reading whichever fields the active backend
+  fills in (`chargingKnown`/`externalPowerKnown`) before falling back to a
+  manual `usbDetect` GPIO read on boards without a gauge.
+- **Frontlight.** Only X4 Pro has one — `FrontlightManager::present()`
+  gates a `brightness` item that appears in Settings only on that board
+  (see "Menu system"); inert (and absent from the menu) everywhere else.
+- **X4 Pro's input is genuinely different**, not just a config variant:
+  `InputStyle::DigitalButtons`, not the ADC ladder. Per its `BoardConfig`
+  profile, `back`/`confirm`/`left`/`right` are all `PIN_UNASSIGNED` — the
+  two physical nav buttons wire to the semantic `UP`/`DOWN` slots instead,
+  so what reads as "hold UP to nap" or "hold DOWN to get dizzy" elsewhere
+  is, on this board, physically the two nav buttons. `CONFIRM` is
+  synthesized from a touch tap (`InputManager::getState()` ORs in
+  `serviceTouch()`'s result automatically — no extra code needed). `BACK`
+  has no physical button or synthesized `BTN_BACK` bit at all — the
+  capacitive Home key is its own separate API
+  (`wasHomeKeyTapped()`/`wasHomeKeyPressed()`), not part of the `BTN_*`
+  system `popPress()` drains, so `handleInput()` calls it explicitly and
+  routes a tap to the same `dispatchBack()` every other board's physical
+  `BACK` button calls. `LEFT`/`RIGHT` have no physical or synthesized path
+  on this board at all; transcript scrolling still works via `BACK`'s
+  "next page" behavior (see "Controls"), just without the fine-grained
+  back-and-forth `LEFT`/`RIGHT` gives on X4/X3.
 
 ## Building and flashing
 
 Install
 [PlatformIO Core](https://docs.platformio.org/en/latest/core/installation/),
-then:
+then, for X4 or X3:
 
 ```bash
-pio run -e xteink_x4
-pio run -e xteink_x4 -t upload   # over USB, once built
+pio run -e xteink
+pio run -e xteink -t upload   # over USB, once built
+```
+
+or for X4 Pro:
+
+```bash
+pio run -e xteink_x4pro
+pio run -e xteink_x4pro -t upload
 ```
 
 ### Flashing from the browser
 
-`.github/workflows/firmware.yml` builds this target on every push to `main`
-and publishes it to GitHub Pages as a one-click web installer
+`.github/workflows/firmware.yml` builds both targets on every push to
+`main` and publishes them to GitHub Pages as one one-click web installer
 ([ESP Web Tools](https://esphome.github.io/esp-web-tools/), Web Serial —
-desktop Chrome or Edge only). The workflow merges the bootloader, partition
+desktop Chrome or Edge only). The manifest carries both chip families
+(ESP32-C3 for X4/X3, ESP32-S3 for X4 Pro) in one `builds` array; ESP Web
+Tools reads the connected chip and installs the matching entry
+automatically, so the page needs only one Install button for all three
+boards. For each target, the workflow merges the bootloader, partition
 table, `boot_app0`, and app into one image at the offsets `pio run -t
-upload` itself would use (`0x0`/`0x8000`/`0xe000`/`0x10000` for this board's
-`default_16MB.csv` scheme — confirmed by capturing pio's own planned
-`esptool` invocation, not assumed), so the browser only has to write one
-file. The same job also uploads the merged image (and the unmerged parts)
-as a downloadable build artifact on every push and PR, not just `main`.
+upload` itself would use (`0x0`/`0x8000`/`0xe000`/`0x10000` — identical
+between the two chips in this Arduino core, confirmed by capturing pio's
+own planned `esptool` invocation for both `env:xteink` and
+`env:xteink_x4pro` separately, not assumed), so the browser only has to
+write one file. The same job also uploads both merged images (and the
+unmerged parts) as downloadable build artifacts on every push and PR, not
+just `main`.
 
 **One-time setup this workflow can't do for you:** in the repo's **Settings
 → Pages**, set **Source** to **GitHub Actions**. Until that's set, the
@@ -78,7 +163,7 @@ as a downloadable build artifact on every push and PR, not just `main`.
 If you're starting from a previously-flashed device, wipe it first:
 
 ```bash
-pio run -t erase && pio run -t upload
+pio run -e xteink -t erase && pio run -e xteink -t upload   # (env:xteink_x4pro for X4 Pro)
 ```
 
 ## Pairing
@@ -127,6 +212,16 @@ also fires the button's normal action, so waking the device can't
 accidentally approve or deny a prompt you haven't seen yet. An incoming
 approval prompt wakes a sleeping screen automatically so it's never missed.
 
+**On X4 Pro**, this table's semantic buttons map to different physical
+controls — see "Multi-board support" for the full explanation. In short:
+`CONFIRM` is a touch tap anywhere on the panel, `BACK` is the capacitive
+Home key (there is no `LEFT`/`RIGHT` on this board — transcript scrolling
+falls back to `BACK`'s "next page" behavior), and the two physical nav
+buttons are wired to the semantic `UP`/`DOWN` slots, so "hold UP to nap"
+and "hold DOWN for dizzy" are physically those two buttons rather than a
+directional pair. `POWER` and `CONFIRM`-hold-for-menu work the same as
+X4/X3.
+
 **Input polling is async, not synchronous with the render loop.**
 `display.displayWindow()`/`displayBuffer()` block the main loop for
 anywhere from ~50ms (a small partial refresh) to ~2s (a full refresh) — a
@@ -150,7 +245,7 @@ task owns the edge state.
 | `busy`      | sessions actively running   | sweating, working           |
 | `attention` | approval pending            | alert, bit-inverted blink   |
 | `celebrate` | level up (every 50K tokens) | confetti, bouncing          |
-| `dizzy`     | `DOWN` held                 | spiral eyes, wobbling        |
+| `dizzy`     | `DOWN` held, or a real shake on X3 | spiral eyes, wobbling |
 | `heart`     | approved in under 5s        | floating hearts             |
 
 ## Menu system
@@ -174,9 +269,11 @@ Holding `CONFIRM` opens the **menu** (`settings`, `turn off`, `help`,
 `about`, `demo`, `close`) — `CONFIRM` taps advance the selection, `BACK`
 acts on it, matching the earlier generation's `A`-advances/`B`-selects
 pattern exactly. `settings` opens a submenu (`hud`, `flash`, `character`,
-`reset`, `back`): `hud` toggles the home screen's session/transcript
-content, `flash` toggles the bit-inverted blink during `attention` (the
-substitute for that generation's LED), `character` cycles through the
+`brightness` — X4 Pro only, see below —, `reset`, `back`): `hud` toggles
+the home screen's session/transcript content, `flash` toggles the
+bit-inverted blink during `attention` (the substitute for that
+generation's LED, still used even on boards that could theoretically have
+a real one, since none of these three do), `character` cycles through the
 compiled-in `bufo` plus every `.charpack` found on the SD card at boot
 (persisted to NVS). `reset` opens a tap-twice-to-confirm submenu:
 `delete char` reverts to the compiled-in `bufo` (without touching the SD
@@ -184,25 +281,42 @@ card's files — unlike the earlier generation, this firmware doesn't own
 that storage), and `factory reset` clears NVS (stats, owner, pet name,
 settings, character choice) and BLE bonds, then restarts.
 
+**Brightness** (X4 Pro only, appears in Settings only when
+`FrontlightManager::present()`) cycles the real dual warm/cool frontlight
+through 5 steps (20–100%) via `FrontlightManager::setBrightness()` — the
+one setting from the earlier M5-era generation that has a genuine hardware
+match here, restored rather than substituted (that generation's own
+brightness control had no equivalent on plain X4/X3, which have no
+frontlight at all).
+
 **Turn off** puts the device into real ESP32 deep sleep
 (`PowerManager::deepSleepUntilPowerButton()`), woken by the `POWER`
-button — this board has no PMIC hard-off like the earlier generation's
-AXP192, so deep sleep is the equivalent off state.
+button — none of these three boards has a PMIC hard-off like the earlier
+generation's AXP192, so deep sleep is the equivalent off state on all of
+them.
 
-**Clock face.** With no RTC, there's nowhere to persist wall-clock time
-across a reboot — but `platformTimeSync()` (`main.cpp`) keeps a software
-clock in RAM: one synced moment (from the bridge's `time` heartbeat) plus
-the `millis()` it arrived at, with "now" derived by adding elapsed time on
-every read. When nothing's happening (home screen, no sessions, no
-overlay open, on USB power, and the clock has synced at least once since
-boot), the home screen shows this clock instead of session info, and the
-pet's mood follows the same hour-of-day/weekday table the earlier
-generation used (a pure function of the time, so it needed no changes).
+**Clock face.** On X3 and X4 Pro, `Rtc` reads real wall-clock time that
+survives a reboot; `platformTimeSync()` (`main.cpp`) writes every bridge
+time-sync through to it. X4 has no RTC, so it falls back to a software
+clock kept in RAM: one synced moment (from the bridge's `time` heartbeat)
+plus the `millis()` it arrived at, with "now" derived by adding elapsed
+time on every read — resets on reboot, accurate only while powered (see
+"Multi-board support"). When nothing's happening (home screen, no
+sessions, no overlay open, on USB power, and the clock has a value —
+immediately on boot for X3/X4 Pro if the RTC was ever set, or after the
+first bridge sync this session on X4), the home screen shows this clock
+instead of session info, and the pet's mood follows the same hour-of-day/
+weekday table the earlier generation used (a pure function of the time,
+so it needed no changes).
 
-**Nap** (`UP` held) is this board's substitute for that generation's
-face-down-to-nap gesture, which needed an IMU this board doesn't have —
-see "Known limitations". It pauses the pet's animation and accumulates nap
-time toward the same stat the gesture did; holding `UP` again ends it.
+**Nap** (`UP` held) is this firmware's substitute for that generation's
+face-down-to-nap gesture, which needed an IMU — used on every board here,
+even X3 (which does have a real IMU): shake already covers "something
+physical happened to the device," and repurposing that same sensor for
+"user deliberately wants a nap" would conflate two different intents, so
+nap stays a deliberate button hold everywhere. It pauses the pet's
+animation and accumulates nap time toward the same stat the gesture did;
+holding `UP` again ends it.
 
 ### Sprite region and refresh strategy
 
@@ -210,10 +324,15 @@ The generated bufo assets top out at 192×200px (`bufo::MAX_ICON_W/H`). The
 fixed animation region is `SPRITE_X=40, SPRITE_Y=40, SPRITE_W=240,
 SPRITE_H=260` (`main.cpp`) — byte-aligned on both axes (240/8=30) so the
 `attention`-state bit-inversion trick below never touches a partial byte at
-the region's edge — with the rest of the 800×480 panel to the right as a
+the region's edge — with the rest of the panel to the right as a
 text/status panel (session counts, transcript, approval prompt, battery,
 BLE link state), drawn with `FreeInkUI`'s dependency-free `DisplayTarget`
-(bundled Noto Sans bitmap font, no external font library).
+(bundled Noto Sans bitmap font, no external font library). The sprite
+region's fixed size comfortably fits every board's panel (800×480 on
+X4/X4 Pro, 792×528 on X3); everything panel-relative around it
+(`PANEL_TOTAL_W`/`H`, `PANEL_W`, every full-screen overlay) reads the real
+size from `display.getDisplayWidth()`/`getDisplayHeight()` at boot instead
+of assuming 800×480 — see "Multi-board support".
 
 | State | What runs | Why |
 |---|---|---|
@@ -360,62 +479,103 @@ pick `--scale` to match, same constraint as the compiled-in asset.
 
 ## Resource budget
 
+`env:xteink` (X4/X3, ESP32-C3, from `pio run -e xteink`):
+
 ```
-RAM:   [==        ]  15.5% (used 50748 bytes from 327680 bytes)
-Flash: [==        ]  22.0% (used 1443631 bytes from 6553600 bytes)
+RAM:   [==        ]  15.5% (used 50940 bytes from 327680 bytes)
+Flash: [==        ]  22.3% (used 1461593 bytes from 6553600 bytes)
 ```
 
-From `pio run -e xteink_x4`'s size report (ESP32-C3, `default_16MB.csv`
-partition scheme — the generic `esp32-c3-devkitm-1` board definition's
-stock partition table targets a 4MB part and is too small for this image;
-the X4 is a real 16MB part, so this env sets `board_build.partitions =
-default_16MB.csv` explicitly). The RAM figure is static `.data`/`.bss`
-only, from the linker's own accounting. It does **not** include the ~48KB
-single-buffer e-paper framebuffer (`displayWidth / 8 * displayHeight` =
-100 × 480), which `FreeInkDisplay::begin()` heap-allocates at runtime, nor
-NimBLE's own heap usage — both come out of the ~278KB of DRAM left after
-the static image, alongside whatever `ArduinoJson`'s `JsonDocument` needs
-per incoming heartbeat. SD card support adds SdFat's own static footprint
-plus `SdCharacterPack`'s fixed index arrays and its 16KB frame buffer (see
-"SD-backed character packs") — all static, none of it heap, so it shows up
-here rather than eating into that ~278KB at runtime.
+`env:xteink_x4pro` (ESP32-S3, from `pio run -e xteink_x4pro`):
+
+```
+RAM:   [==        ]  18.8% (used 61740 bytes from 327680 bytes)
+Flash: [==        ]  23.1% (used 1511286 bytes from 6553600 bytes)
+```
+
+Both use `default_16MB.csv` for `board_build.partitions` — the generic
+board definitions' stock partition tables (both C3 and S3) target a
+smaller flash part than either board's real 16MB, and X4 Pro's own OEM
+dual-OTA scheme isn't needed since this isn't an OTA-updated build (see
+`platformio.ini`). The RAM figures are static `.data`/`.bss` only, from
+the linker's own accounting. They do **not** include the e-paper
+framebuffer (`displayWidth / 8 * displayHeight` — ~48KB on X4/X4 Pro's
+800×480, ~52KB on X3's 792×528), which `FreeInkDisplay::begin()`
+heap-allocates at runtime, nor NimBLE's own heap usage — both come out of
+the DRAM left after the static image, alongside whatever `ArduinoJson`'s
+`JsonDocument` needs per incoming heartbeat. SD card support adds SdFat's
+own static footprint plus `SdCharacterPack`'s fixed index arrays and its
+16KB frame buffer (see "SD-backed character packs") — all static, none of
+it heap. X4 Pro's slightly higher numbers are the touch/frontlight/RTC/
+gauge libraries this board actually uses, plus PSRAM bring-up code from
+`-DBOARD_HAS_PSRAM`.
 
 ## Known limitations
 
-- No shake gesture — the X4 has no IMU. `DOWN` held substitutes for
-  triggering `dizzy`; face-down nap detection is similarly replaced with
-  `UP` held (see "Menu system" > "Nap") rather than dropped outright.
-- No wall-clock time across reboots — the X4 has no RTC, so the clock face
-  (see "Menu system") runs on a software clock that resets to unsynced on
-  every boot until the bridge sends its next `time` heartbeat, and drifts
-  with `millis()` between syncs rather than ticking off real hardware time.
-- No buzzer, no LED, no brightness/frontlight control — the X4's
-  `BoardConfig` profile declares `NO_AUDIO`, `NO_LEDS`, and `NO_FRONTLIGHT`.
-  There's no substitute for these; the earlier generation's sound feedback
-  and brightness setting are dropped rather than faked.
+**On X4 (no IMU, no RTC, no frontlight — see the "Hardware" table):**
+
+- No shake gesture — `DOWN` held substitutes for triggering `dizzy`
+  (X3 gets a real shake in addition to this — see "Multi-board support").
+- No wall-clock time across reboots — the clock face (see "Menu system")
+  runs on a software clock that resets to unsynced on every boot until the
+  bridge sends its next `time` heartbeat, and drifts with `millis()`
+  between syncs rather than ticking off real hardware time (X3 and X4 Pro
+  have a real RTC instead — see "Multi-board support").
+- No brightness control — no frontlight to control (only X4 Pro has one).
+- Battery status's charge current (`mA`) always reads `0`, and `usb`
+  reads `BoardConfig::ACTIVE.usbDetect` (GPIO20) as active-high — this
+  polarity is **an assumption**, not hardware-validated. X3 and X4 Pro's
+  I2C fuel gauges report real percentage/voltage, though charging current
+  isn't observable from either gauge either (no charger IC on their I2C
+  bus — confirmed for X4 Pro's CW2017 in freeink-sdk's own hardware
+  bring-up doc; assumed the same for X3's BQ27220, untested).
+
+**On all three boards:**
+
+- No buzzer, no LED — none of X4/X3/X4 Pro has either
+  (`BoardConfig` declares `NO_AUDIO`/`NO_LEDS` on all three). There's no
+  substitute; the earlier M5-era generation's sound feedback is dropped
+  rather than faked, and its LED-blink-on-`attention` is replaced
+  everywhere with the bit-inverted sprite flash (see "The seven states").
 - The 18 hand-tuned ASCII-species characters from the earlier generation
   aren't ported — they were pixel-position-tuned text art for a 135×240
-  color LCD at 5fps, and re-tuning all of them for 800×480 monochrome
-  e-paper's much slower partial-refresh cadence would be a from-scratch
-  effort per species. This board's answer to "multiple characters" is the
-  compiled-in `bufo` plus SD `.charpack` cycling instead (see "SD-backed
-  character packs" and "Menu system").
-- Battery status's charge current (`mA`) always reads `0` — the X4 has no
-  charge-status pin to read it from.
-- Battery status's `usb` flag reads `BoardConfig::ACTIVE.usbDetect`
-  (GPIO20) as active-high — this polarity is **an assumption**, not
-  hardware-validated.
+  color LCD at 5fps, and re-tuning all of them for monochrome e-paper's
+  much slower partial-refresh cadence would be a from-scratch effort per
+  species regardless of which of these three boards it targeted. Their
+  answer to "multiple characters" is the compiled-in `bufo` plus SD
+  `.charpack` cycling instead (see "SD-backed character packs" and "Menu
+  system").
 - BLE folder-push writes only the compiled-in flash path today, not SD —
   see "What this is not — yet" under "SD-backed character packs" above.
-- The browser flasher (`site/index.html`) assumes Web Serial can reset the
-  X4 into its ROM bootloader automatically. The X4 uses its native USB
-  port for serial (`ARDUINO_USB_MODE=1`), not a separate USB-UART bridge
-  chip — whether Arduino-ESP32's app-side USB CDC driver answers the reset
-  request the same way a bridge chip would is **not hardware-verified**.
-  The page documents the manual fallback (hold BOOT while plugging in) so
-  flashing still works either way.
+- The browser flasher (`site/index.html`) assumes Web Serial can reset
+  each board into its ROM bootloader automatically. All three use their
+  native USB port for serial (`ARDUINO_USB_MODE=1`), not a separate
+  USB-UART bridge chip — whether Arduino-ESP32's app-side USB CDC driver
+  answers the reset request the same way a bridge chip would is **not
+  hardware-verified** for any of them. The page documents the manual
+  fallback (hold BOOT while plugging in) so flashing still works either
+  way.
+
+**X4 Pro-specific, unverified:**
+
+- Touch axis flip (`flipX`/`flipY`) is still unconfirmed on hardware per
+  freeink-sdk's own bring-up doc — corner-tap accuracy for the automatic
+  `CONFIRM` touch-tap synthesis is untested.
+- `wasHomeKeyTapped()`'s async-polling safety hasn't been independently
+  re-verified the way the generic per-button `wasPressed()`/`popPress()`
+  split has (see "Controls" > "Input polling is async"); it's called from
+  the same place and trust level as the confirmed-safe `isPressed()`
+  calls, but the SDK's own async-safety documentation was written with
+  the generic button API in mind, not the Home key's separate one.
+- No X4 Pro unit has been used to test this firmware — everything above
+  is built from freeink-sdk's own hardware bring-up documentation
+  (`docs/xteink-x4pro-support.md`), the same rigor applied to the original
+  X4 port's "Step 0" SDK verification, not assumed.
 
 ## Project layout
+
+One `src/` tree builds all three boards (`env:xteink` for X4/X3,
+`env:xteink_x4pro` for X4 Pro — see "Multi-board support"):
 
 ```
 src/
@@ -423,7 +583,7 @@ src/
   ble_bridge.cpp/h          — Nordic UART service, line-buffered TX/RX
   data.h                    — wire protocol, JSON parse
   xfer.h                    — command handling (name/owner/status/unpair)
-  stats.h                   — NVS-backed stats, pet name, owner name
+  stats.h                   — NVS-backed stats, pet name, owner name, settings
   assets/icons_bufo.h        — generated Icon assets (see tools/gif_to_icons.py)
   sd_character_pack.h/.cpp   — reads an SD-card .charpack at runtime
 characters/                — example GIF character packs (bufo/bufo.charpack is the

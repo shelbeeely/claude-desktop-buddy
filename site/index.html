@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Claude Desktop Buddy — Xteink X4 flasher</title>
+<title>Claude Desktop Buddy — Xteink flasher</title>
 <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
 <style>
   :root {
@@ -107,8 +107,8 @@
 </head>
 <body>
 <main>
-  <h1>Claude Desktop Buddy — Xteink X4</h1>
-  <p class="sub">Flash the FreeInk-based desk-pet firmware straight from this page. No local toolchain needed.</p>
+  <h1>Claude Desktop Buddy — Xteink</h1>
+  <p class="sub">Flash the FreeInk-based desk-pet firmware straight from this page — X4, X3, or X4 Pro. No local toolchain needed.</p>
 
   <div id="browser-warning" class="browser-warning">
     This browser doesn't support <a href="https://developer.mozilla.org/en-US/docs/Web/API/Web_Serial_API" target="_blank" rel="noopener">Web Serial</a>,
@@ -118,7 +118,7 @@
   </div>
 
   <h2>1. Connect</h2>
-  <p>Plug the Xteink X4 into your computer with a USB-C cable.</p>
+  <p>Plug your Xteink device (X4, X3, or X4 Pro) into your computer with a USB-C cable.</p>
 
   <h2>2. Install</h2>
   <div class="install-row">
@@ -126,32 +126,40 @@
     <span class="version">build info in the manifest, updated on every push to <code>main</code></span>
   </div>
   <p>
-    Click <strong>Connect</strong>, pick the X4's serial port from the browser prompt, then
+    Click <strong>Connect</strong>, pick the device's serial port from the browser prompt, then
     <strong>Install</strong>. This erases the device and writes the full image (bootloader,
-    partition table, and app) in one pass.
+    partition table, and app) in one pass. The manifest carries builds for both chip families
+    (ESP32-C3 for X4/X3, ESP32-S3 for X4 Pro) — ESP Web Tools reads the connected chip and picks
+    the matching one automatically, so this one button covers all three boards.
   </p>
   <p>
     If nothing shows up in the port picker, or the install stalls right after connecting: hold the
-    <strong>BOOT</strong> button (or short GPIO9 to GND) while plugging in the USB cable, then try
-    Connect again. The X4 uses its native USB port for serial rather than a separate USB-UART bridge
-    chip, and whether the browser can reset it into the bootloader automatically hasn't been confirmed
-    on hardware yet — holding BOOT forces it into download mode regardless.
+    <strong>BOOT</strong> button while plugging in the USB cable, then try Connect again. These
+    boards use their native USB port for serial rather than a separate USB-UART bridge chip, and
+    whether the browser can reset them into the bootloader automatically hasn't been confirmed on
+    hardware yet — holding BOOT forces it into download mode regardless.
   </p>
 
   <h2 id="manual">Manual flashing (fallback)</h2>
   <p>
-    If the web installer doesn't work for your setup, download the merged image from this build and
-    flash it with <a href="https://docs.espressif.com/projects/esptool/en/latest/esp32c3/" target="_blank" rel="noopener">esptool</a>
+    If the web installer doesn't work for your setup, download the merged image for your board from
+    this build and flash it with <a href="https://docs.espressif.com/projects/esptool/en/latest/" target="_blank" rel="noopener">esptool</a>
     directly:
   </p>
+  <p><strong>X4 / X3</strong> (ESP32-C3):</p>
   <pre>pip install esptool
-esptool --chip esp32c3 --port /dev/ttyACM0 write-flash 0x0 xteink_x4.bin</pre>
-  <p><a href="firmware/xteink_x4.bin">Download xteink_x4.bin</a> (single merged image, flash at offset 0x0).</p>
+esptool --chip esp32c3 --port /dev/ttyACM0 write-flash 0x0 xteink.bin</pre>
+  <p><a href="firmware/xteink.bin">Download xteink.bin</a> (single merged image, flash at offset 0x0).</p>
+  <p><strong>X4 Pro</strong> (ESP32-S3):</p>
+  <pre>pip install esptool
+esptool --chip esp32s3 --port /dev/ttyACM0 write-flash 0x0 xteink_x4pro.bin</pre>
+  <p><a href="firmware/xteink_x4pro.bin">Download xteink_x4pro.bin</a> (single merged image, flash at offset 0x0).</p>
 
   <h2>Source</h2>
   <p>
     Built automatically from <a href="https://github.com/shelbeeely/claude-desktop-buddy" target="_blank" rel="noopener">shelbeeely/claude-desktop-buddy</a>
-    (<code>env:xteink_x4</code>) on every push to <code>main</code> — see
+    (<code>env:xteink</code> for X4/X3, <code>env:xteink_x4pro</code> for X4 Pro) on every push to
+    <code>main</code> — see
     <a href="https://github.com/shelbeeely/claude-desktop-buddy/blob/main/README.md#known-limitations" target="_blank" rel="noopener">README.md "Known limitations"</a>
     for hardware details and known unverified assumptions.
   </p>
