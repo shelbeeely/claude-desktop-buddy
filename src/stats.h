@@ -218,3 +218,47 @@ inline void ownerSet(const char* name) {
 inline const char* ownerName() { return _ownerName; }
 
 inline const Stats& stats() { return _stats; }
+
+// Trimmed from the earlier desktop-buddy generation's Settings struct: sound/
+// bluetooth/wifi/clockRot had no X4 equivalent (no buzzer, BT/WiFi toggles
+// were stored-only even on the original board, clockRot needed IMU
+// orientation this board doesn't have). `led` is renamed `flash` — X4 has no
+// LED, but this still gates the bit-inverted sprite blink that substitutes
+// for one during `attention`.
+struct Settings {
+  bool hud = true;
+  bool flash = true;
+};
+static Settings _settings;
+
+inline void settingsLoad() {
+  _prefs.begin("buddy", true);
+  _settings.hud = _prefs.getBool("hud", true);
+  _settings.flash = _prefs.getBool("flash", true);
+  _prefs.end();
+}
+
+inline void settingsSave() {
+  _prefs.begin("buddy", false);
+  _prefs.putBool("hud", _settings.hud);
+  _prefs.putBool("flash", _settings.flash);
+  _prefs.end();
+}
+
+inline Settings& settings() { return _settings; }
+
+// Persists which installed character (index into main.cpp's characterList —
+// 0 is always the compiled-in bufo, 1..N are SD .charpack files) to reopen
+// on the next boot. Replaces the earlier generation's speciesIdx.
+inline uint8_t characterIdxLoad() {
+  _prefs.begin("buddy", true);
+  uint8_t v = _prefs.getUChar("charidx", 0);
+  _prefs.end();
+  return v;
+}
+
+inline void characterIdxSave(uint8_t idx) {
+  _prefs.begin("buddy", false);
+  _prefs.putUChar("charidx", idx);
+  _prefs.end();
+}

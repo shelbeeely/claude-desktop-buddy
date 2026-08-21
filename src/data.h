@@ -67,11 +67,11 @@ static bool _rtcValid = false;
 inline bool dataRtcValid() { return _rtcValid; }
 
 // The X4 has no RTC (BoardConfig::XTEINK_X4 has no CAP_RTC), so there's
-// nowhere to persist wall-clock time through a reboot or deep sleep —
-// main.cpp's platformTimeSync() is a no-op today. Kept as a real hook
-// (declared here, defined in main.cpp) rather than deleted outright so a
-// future consumer (e.g. a status timestamp) has somewhere to start from
-// without touching data.h again.
+// nowhere to persist wall-clock time through a reboot or deep sleep.
+// main.cpp's platformTimeSync() keeps a software clock instead: it stores
+// this synced moment plus millis(), and derives "now" by adding elapsed
+// time on every render — accurate while powered, reset on reboot, good
+// enough to drive the idle clock-face screen (see README).
 void platformTimeSync(const struct tm& localTime);
 
 static void _applyJson(const char* line, TamaState* out) {

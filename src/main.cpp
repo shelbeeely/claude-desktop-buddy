@@ -1,17 +1,30 @@
 // claude-desktop-buddy — Xteink X4 firmware.
 //
 // Nordic UART Service BLE bridge (ble_bridge.cpp/h) + JSON wire protocol
-// (data.h, xfer.h) + NVS-backed stats/owner (stats.h) driving a 7-state
-// desk pet rendered on FreeInk (e-paper display, InputManager for the
-// 7-button ADC ladder, BatteryMonitor). sd_character_pack.h/.cpp optionally
-// replaces the compiled-in bufo icons below with one discovered on the SD
-// card at boot — see README.md "SD-backed character packs".
+// (data.h, xfer.h) + NVS-backed stats/owner/settings (stats.h) driving a
+// 7-state desk pet rendered on FreeInk (e-paper display, InputManager for
+// the 7-button ADC ladder, BatteryMonitor). sd_character_pack.h/.cpp
+// implements one installed character; main.cpp's characterList[] enumerates
+// the compiled-in bufo plus every SD .charpack found at boot and lets the
+// settings menu cycle between them — see README.md "SD-backed character
+// packs" and "Menu system".
+//
+// This aims to be as close a match to the earlier M5StickCPlus-based
+// desktop-buddy's UX as this board's hardware allows: same menu/settings/
+// reset structure, same info/pet page layout, same approve/deny-in-a-prompt
+// behavior. Divergences are called out inline and in README.md "Known
+// limitations" — the X4 has no IMU (no shake, no face-down nap detection,
+// no clock orientation), no buzzer, no LED, and no RTC
+// (BoardConfig::XTEINK_X4: NO_SENSORS, NO_AUDIO, NO_LEDS; FREEINK_CAP_RTC's
+// device list excludes X4), so those features are substituted with button
+// gestures or software equivalents rather than ported literally.
 //
 // See README.md for the sprite-region size, the full-refresh timer
-// interval, and the input mapping.
+// interval, and the full input mapping.
 
 #include <Arduino.h>
 #include <new>
+#include <time.h>
 #include <esp_mac.h>
 #include <BoardConfig.h>
 #include <EInkDisplay.h>
@@ -19,6 +32,7 @@
 #include <BatteryMonitor.h>
 #include <FreeInkUIDisplayTarget.h>
 #include <SDCardManager.h>
+#include <PowerManager.h>
 #include <SPI.h>
 
 #include "ble_bridge.h"
@@ -38,16 +52,30 @@ using freeink::ui::TextStyle;
 // Platform hooks required by data.h / xfer.h (see their declarations).
 // ---------------------------------------------------------------------------
 
-// X4 has no RTC (BoardConfig::XTEINK_X4 -> FREEINK_CAP_RTC is off — see
-// BoardConfig.h's FREEINK_CAP_RTC device list, which does not include X4),
-// and this port has no clock-face screen to feed (that M5 feature depended
-// on IMU-based orientation detection the X4 also doesn't have — see README
-// "Divergences"). Nothing on this board currently consumes wall-clock time,
-// so the hook is a deliberate no-op rather than storing a value nothing
-// reads. data.h still sets dataRtcValid() true after calling this, per its
-// documented contract — a future consumer (e.g. a status timestamp) can
-// start from here without touching data.h again.
-void platformTimeSync(const struct tm&) {}
+// Software clock: no RTC on this board, so we keep one synced moment (from
+// the bridge's "time" heartbeat) plus the millis() it arrived at, and derive
+// "now" by adding elapsed time on every read. Resets on reboot; accurate
+// while powered. mktime()/gmtime_r() are used purely as a matched pair to
+// add seconds to a struct tm — since both go through the same C library TZ
+// state, the actual TZ setting (unconfigured -> UTC on this core) never
+// matters, only that encode/decode are inverses.
+static time_t   swClockBase = 0;
+static uint32_t swClockSyncMs = 0;
+static bool     swClockValid = false;
+
+void platformTimeSync(const struct tm& localTime) {
+  struct tm lt = localTime;
+  swClockBase = mktime(&lt);
+  swClockSyncMs = millis();
+  swClockValid = true;
+}
+
+static bool getSoftClock(struct tm& out, uint32_t now) {
+  if (!swClockValid) return false;
+  time_t t = swClockBase + (time_t)((now - swClockSyncMs) / 1000);
+  gmtime_r(&t, &out);
+  return true;
+}
 
 BatteryMonitor batteryMonitor;
 PlatformBatteryStatus platformBatteryStatus() {
@@ -59,10 +87,11 @@ PlatformBatteryStatus platformBatteryStatus() {
   // == PIN_UNASSIGNED), so BatteryMonitor can't report charging/mA. usbDetect
   // (GPIO20) IS wired on the profile; we read it directly here since nothing
   // in the SDK's ADC battery backend consumes it. Polarity (active-high) is
-  // an assumption, NOT hardware-validated — flagged in README "Divergences".
-  // The X4 Pro reverse-engineering doc explicitly notes its own VBUS/USB
-  // pin was "not conclusively identified" even after a hardware RE session,
-  // so treat this the same way until someone confirms it on a scope.
+  // an assumption, NOT hardware-validated — flagged in README "Known
+  // limitations". The X4 Pro reverse-engineering doc explicitly notes its
+  // own VBUS/USB pin was "not conclusively identified" even after a
+  // hardware RE session, so treat this the same way until someone confirms
+  // it on a scope.
   if (BoardConfig::ACTIVE.usbDetect != BoardConfig::PIN_UNASSIGNED) {
     out.usb = digitalRead(BoardConfig::ACTIVE.usbDetect) == HIGH;
   }
@@ -71,8 +100,8 @@ PlatformBatteryStatus platformBatteryStatus() {
 }
 
 // ---------------------------------------------------------------------------
-// State machine — identical derivation to the M5 build's derive() in
-// main.cpp, just renamed/re-typed here.
+// State machine — identical derivation to the earlier desktop-buddy
+// generation's derive(), just renamed/re-typed here.
 // ---------------------------------------------------------------------------
 enum PersonaState : uint8_t { P_SLEEP, P_IDLE, P_BUSY, P_ATTENTION, P_CELEBRATE, P_DIZZY, P_HEART, P_COUNT };
 static const char* const kStateNames[P_COUNT] = {
@@ -168,8 +197,6 @@ static void drawIconCentered(const freeink::Icon& icon) {
 static const freeink::Icon* currentFrame(PersonaState state, uint32_t now, uint32_t stateEnteredMs) {
   const bufo::IconState& is = bufo::bufo_states[state];
   if (is.clipCount == 0) return nullptr;
-  // Idle carousel: advance to the next clip each time the current one loops.
-  // Non-idle states have exactly one clip, so this is a no-op there.
   uint32_t elapsed = now - stateEnteredMs;
   uint32_t clipMs = 0;
   for (uint8_t f = 0; f < is.clips[0].frameCount; f++) clipMs += is.clips[0].frames[f].durationMs;
@@ -185,12 +212,19 @@ static const freeink::Icon* currentFrame(PersonaState state, uint32_t now, uint3
   return clip.frames[clip.frameCount - 1].icon;
 }
 
-// --- SD-backed character (optional) ------------------------------------------
-// See README.md "SD-backed character packs": if a .charpack file is found on
-// the SD card at boot, it replaces the compiled-in bufo icons for every
-// state. Falls back to bufo automatically if there's no SD card, no pack on
-// it, or a read hiccup mid-animation (getCurrentIcon() below) — the device
-// is never left with nothing to draw.
+// --- Installed characters: bufo (compiled-in) + every SD .charpack --------
+// Settings > "character" cycles this list (matches the earlier generation's
+// "ascii pet" cycling setting, adapted to this board's character system —
+// see the AskUserQuestion decision recorded in README "Menu system").
+struct CharacterEntry {
+  bool isSd;
+  char path[80];
+};
+static constexpr uint8_t MAX_CHARACTERS = 9;  // bufo + up to 8 SD packs
+static CharacterEntry characterList[MAX_CHARACTERS];
+static uint8_t characterCount = 0;
+static uint8_t characterIdx = 0;
+
 static SdCharacterPack sdPack;
 static bool sdCharacterActive = false;
 // Covers up to ~320x400px @ 1bpp (⌈320/8⌉ * 400 = 16000) with margin over
@@ -199,6 +233,45 @@ static bool sdCharacterActive = false;
 // runtime dimension check here, same as the compiled-in asset (see README).
 static constexpr size_t SD_FRAME_BUF_CAP = 16000;
 static uint8_t sdFrameBuf[SD_FRAME_BUF_CAP];
+
+static void scanCharacters() {
+  characterCount = 0;
+  characterList[characterCount].isSd = false;
+  characterList[characterCount].path[0] = 0;
+  characterCount++;  // bufo is always index 0
+  if (SdMan.ready()) {
+    for (const String& name : SdMan.listFiles("/characters")) {
+      if (characterCount >= MAX_CHARACTERS) break;
+      if (!name.endsWith(".charpack")) continue;
+      CharacterEntry& e = characterList[characterCount];
+      e.isSd = true;
+      snprintf(e.path, sizeof(e.path), "/characters/%s", name.c_str());
+      characterCount++;
+    }
+  }
+}
+
+// Opens characterList[idx] (falling back to bufo — index 0 — if it's out of
+// range or the SD file won't open) and updates sdCharacterActive.
+static void applyCharacter(uint8_t idx) {
+  if (idx >= characterCount) idx = 0;
+  characterIdx = idx;
+  sdCharacterActive = false;
+  if (characterList[idx].isSd && sdPack.open(characterList[idx].path)) {
+    sdCharacterActive = true;
+    Serial.printf("[char] loaded %s\n", characterList[idx].path);
+  } else if (characterList[idx].isSd) {
+    Serial.printf("[char] failed to open %s, falling back to bufo\n", characterList[idx].path);
+    characterIdx = 0;
+  } else {
+    Serial.println("[char] bufo (compiled-in)");
+  }
+}
+
+static void nextCharacter() {
+  applyCharacter((characterIdx + 1) % characterCount);
+  characterIdxSave(characterIdx);
+}
 
 // Resolves to an Icon for (state, now-stateEnteredMs), preferring the SD
 // pack when one is active and falling back to the compiled-in bufo tables
@@ -224,11 +297,21 @@ static uint32_t lastSpriteDrawMs = 0;
 static bool     sleepFrameDrawn = false;
 static bool     attentionFlashOn = false;
 
+// Menu/settings/reset overlays and the pairing-passkey screen replace the
+// whole panel (they're modal, matching the earlier generation's floating
+// menu box) — pausing sprite animation underneath avoids partial-refresh
+// artifacts flickering through a static box. Nap (see "Nap" below) pauses
+// it too.
+static bool overlayOpen = false;
+static bool napping = false;
+static uint32_t napStartMs = 0;
+static bool napFrameDrawn = false;
+
 static void renderSprite(uint32_t now) {
+  if (overlayOpen || napping) return;
+
   switch (activeState) {
     case P_SLEEP:
-      // Static frame, no refresh loop: draw once on entry, then do nothing
-      // until the state changes (checked by the caller via sleepFrameDrawn).
       if (sleepFrameDrawn) return;
       clearSpriteRegion();
       {
@@ -240,8 +323,6 @@ static void renderSprite(uint32_t now) {
       return;
 
     case P_IDLE:
-      // Slow-cadence partial refresh — e-ink reads a slow blink as
-      // charming, not laggy (per the original README's framing).
       if (now - lastSpriteDrawMs < 1500) return;
       clearSpriteRegion();
       {
@@ -252,8 +333,6 @@ static void renderSprite(uint32_t now) {
       break;
 
     case P_BUSY:
-      // Fast partial refresh, fixed region only — this is the "working"
-      // animation and wants to read as active.
       if (now - lastSpriteDrawMs < 350) return;
       clearSpriteRegion();
       {
@@ -264,40 +343,35 @@ static void renderSprite(uint32_t now) {
       break;
 
     case P_ATTENTION: {
-      // No LED on this board. Substitute cue: alternate the sprite region
-      // between the normal icon and a bit-inverted version of it, on the
-      // same ~400ms cadence the M5 build blinked its LED at. This reads as
-      // "urgent" the way the idle blink can't, without needing a second
-      // color plane.
+      // No LED on this board. Substitute cue (gated by settings().flash,
+      // the renamed "led" toggle): alternate the sprite region between the
+      // normal icon and a bit-inverted version of it.
       if (now - lastSpriteDrawMs < 400) return;
       clearSpriteRegion();
       {
         freeink::Icon icon;
         if (getCurrentIcon(P_ATTENTION, now, stateEnteredMs, icon)) drawIconCentered(icon);
       }
-      attentionFlashOn = !attentionFlashOn;
-      if (attentionFlashOn) invertSpriteRegionBytes();
+      if (settings().flash) {
+        attentionFlashOn = !attentionFlashOn;
+        if (attentionFlashOn) invertSpriteRegionBytes();
+      }
       display.displayWindow(SPRITE_X, SPRITE_Y, SPRITE_W, SPRITE_H);
       break;
     }
 
     case P_CELEBRATE: {
-      // Infrequent (level-up, every 50K tokens) — can afford full refreshes.
-      // Cycle the clip's frames, one FULL_REFRESH each, capped so a long
-      // clip can't turn a celebration into a multi-second stall.
       if (now - lastSpriteDrawMs < 220) return;
       clearSpriteRegion();
       freeink::Icon icon;
       if (!getCurrentIcon(P_CELEBRATE, now, stateEnteredMs, icon)) break;
       drawIconCentered(icon);
       display.displayBuffer(EInkDisplay::FULL_REFRESH);
-      lastFullRefreshMs = now;  // this refresh already DC-balanced the panel
+      lastFullRefreshMs = now;
       break;
     }
 
     case P_DIZZY:
-      // Short-lived, fast partial — triggered by a button hold (no IMU on
-      // this board; see the input-mapping comment above handleInput()).
       if (now - lastSpriteDrawMs < 200) return;
       clearSpriteRegion();
       {
@@ -308,8 +382,6 @@ static void renderSprite(uint32_t now) {
       break;
 
     case P_HEART:
-      // Similar budget to celebrate but smaller/cheaper: partial refresh,
-      // not full — it fires far more often (every fast approval).
       if (now - lastSpriteDrawMs < 250) return;
       clearSpriteRegion();
       {
@@ -325,23 +397,368 @@ static void renderSprite(uint32_t now) {
   lastSpriteDrawMs = now;
 }
 
+// One static frame (the sleep icon + a "napping" tag) while napping, drawn
+// once on entry — mirrors P_SLEEP's draw-once pattern above.
+static void renderNapFrame() {
+  if (napFrameDrawn) return;
+  clearSpriteRegion();
+  freeink::Icon icon;
+  if (getCurrentIcon(P_SLEEP, millis(), stateEnteredMs, icon)) drawIconCentered(icon);
+  ui().text(Rect{SPRITE_X, SPRITE_Y + SPRITE_H - 24, SPRITE_W, 20}, "napping...",
+            TextStyle{0, TextAlign::Center, Color::DarkGray, 1, false, false});
+  display.displayWindow(SPRITE_X, SPRITE_Y, SPRITE_W, SPRITE_H);
+  napFrameDrawn = true;
+}
+
+// ---------------------------------------------------------------------------
+// Display modes, menu, settings, reset — mirrors the earlier desktop-buddy
+// generation's DISP_NORMAL/PET/INFO + menuOpen/settingsOpen/resetOpen
+// structure. Unlike that build, PET/INFO don't shrink the character sprite
+// to a "peek" size — the sprite region keeps showing the pet regardless of
+// mode, since the X4's panel has room for both at once.
+// ---------------------------------------------------------------------------
+enum DisplayMode : uint8_t { DISP_NORMAL, DISP_PET, DISP_INFO, DISP_COUNT };
+static DisplayMode displayMode = DISP_NORMAL;
+
+static constexpr uint8_t INFO_PAGES = 6;
+static constexpr uint8_t INFO_PG_BUTTONS = 1;
+static constexpr uint8_t INFO_PG_CREDITS = 5;
+static uint8_t infoPage = 0;
+
+static constexpr uint8_t PET_PAGES = 2;
+static uint8_t petPage = 0;
+
+static bool    menuOpen = false;
+static uint8_t menuSel = 0;
+static const char* const menuItems[] = {"settings", "turn off", "help", "about", "demo", "close"};
+static constexpr uint8_t MENU_N = 6;
+
+static bool    settingsOpen = false;
+static uint8_t settingsSel = 0;
+static const char* const settingsItems[] = {"hud", "flash", "character", "reset", "back"};
+static constexpr uint8_t SETTINGS_N = 5;
+
+static bool     resetOpen = false;
+static uint8_t  resetSel = 0;
+static const char* const resetItems[] = {"delete char", "factory reset", "back"};
+static constexpr uint8_t RESET_N = 3;
+static uint32_t resetConfirmUntil = 0;
+static uint8_t  resetConfirmIdx = 0xFF;
+
+static bool needsRedraw = false;  // set by input handlers to force an immediate panel refresh
+
 // --- Status/text panel -------------------------------------------------------
 static bool responseSent = false;
 static char lastPromptId[40] = "";
 static uint32_t promptArrivedMs = 0;
+static char btName[16] = "Claude";
 
-// Screen sleep (POWER button — see "Input mapping" below). Gates loop()'s
-// render/refresh calls; handleInput() wakes on any press while asleep.
 static bool screenAwake = true;
 
-// Transcript scroll (LEFT/RIGHT). tama.lineGen bumps whenever tama.lines
-// changes (see data.h) — loop() resets transcriptOffset on that so a
-// scrolled-away view never shows stale entries against new data.
 static constexpr uint8_t TRANSCRIPT_VISIBLE = 6;
 static uint8_t transcriptOffset = 0;
 static uint16_t lastLineGen = 0;
 
+static void sendCmd(const char* json) {
+  Serial.println(json);
+  size_t n = strlen(json);
+  bleWrite((const uint8_t*)json, n);
+  bleWrite((const uint8_t*)"\n", 1);
+}
+
+static bool clockActive() {
+  bool inPrompt = tama.promptId[0] && !responseSent;
+  return displayMode == DISP_NORMAL && !overlayOpen && !inPrompt
+      && tama.sessionsRunning == 0 && tama.sessionsWaiting == 0
+      && swClockValid && platformBatteryStatus().usb;
+}
+
+// Hour-conditioned mood table shown while the clock face is active — direct
+// port of the earlier generation's clocking activeState logic (pure
+// day-part/weekday rules, no hardware dependency, so it needed no changes).
+static void applyClockMood(const struct tm& lt, uint32_t now) {
+  uint8_t dow = lt.tm_wday;
+  bool weekend = (dow == 0 || dow == 6);
+  bool friday = (dow == 5);
+  uint8_t h = (uint8_t)lt.tm_hour;
+  if (h >= 1 && h < 7)             activeState = P_SLEEP;
+  else if (weekend)                activeState = (now / 8000 % 6 == 0) ? P_HEART : P_SLEEP;
+  else if (h < 9)                  activeState = (now / 6000 % 4 == 0) ? P_IDLE : P_SLEEP;
+  else if (h == 12)                activeState = (now / 5000 % 3 == 0) ? P_HEART : P_IDLE;
+  else if (friday && h >= 15)      activeState = (now / 4000 % 3 == 0) ? P_CELEBRATE : P_IDLE;
+  else if (h >= 22 || h == 0)      activeState = (now / 7000 % 3 == 0) ? P_DIZZY : P_SLEEP;
+  else                             activeState = (now / 10000 % 5 == 0) ? P_SLEEP : P_IDLE;
+}
+
+static void drawClock(uint32_t now, int16_t y) {
+  struct tm lt;
+  if (!getSoftClock(lt, now)) return;
+  static const char* const MON[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+  static const char* const DOW[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+  char hm[6]; snprintf(hm, sizeof(hm), "%02d:%02d", lt.tm_hour, lt.tm_min);
+  char dl[24]; snprintf(dl, sizeof(dl), "%s  %s %d", DOW[lt.tm_wday % 7], MON[lt.tm_mon % 12], lt.tm_mday);
+  // No second bitmap font is bundled to draw big digits (DisplayTarget's
+  // TextStyle has no size/scale field, only a font slot — see
+  // FreeInkUIDisplayTarget.h), so the clock reads at the same size as the
+  // rest of the panel; bold + its own row keeps it the visual anchor.
+  ui().text(Rect{PANEL_X, y, PANEL_W, 28}, hm, TextStyle{0, TextAlign::Left, Color::Black, 1, true, false});
+  y += 32;
+  ui().text(Rect{PANEL_X, y, PANEL_W, 20}, dl, TextStyle{0, TextAlign::Left, Color::DarkGray, 1, false, false});
+}
+
+static void drawPips(int16_t x, int16_t y, uint8_t total, uint8_t filled) {
+  for (uint8_t i = 0; i < total; i++) {
+    Rect r{(int16_t)(x + i * 16), y, 10, 10};
+    if (i < filled) ui().fill(r, Paint::solid(Color::Black), 5);
+    else ui().stroke(r, Paint::solid(Color::DarkGray), 1, 5);
+  }
+}
+
+static void drawPetPage(uint32_t now, int16_t y) {
+  char b[48];
+  if (ownerName()[0]) snprintf(b, sizeof(b), "%s's %s", ownerName(), petName());
+  else snprintf(b, sizeof(b), "%s", petName());
+  ui().text(Rect{PANEL_X, y, PANEL_W - 60, 24}, b, TextStyle{0, TextAlign::Left, Color::Black, 1, true, false});
+  snprintf(b, sizeof(b), "%u/%u", petPage + 1, PET_PAGES);
+  ui().text(Rect{(int16_t)(PANEL_X + PANEL_W - 60), y, 60, 24}, b,
+            TextStyle{0, TextAlign::Right, Color::DarkGray, 1, false, false});
+  y += 32;
+
+  if (petPage == 0) {
+    ui().text(Rect{PANEL_X, y, 80, 20}, "mood", TextStyle{0, TextAlign::Left, Color::DarkGray, 1, false, false});
+    drawPips(PANEL_X + 70, y, 4, statsMoodTier());
+    y += 24;
+    ui().text(Rect{PANEL_X, y, 80, 20}, "fed", TextStyle{0, TextAlign::Left, Color::DarkGray, 1, false, false});
+    drawPips(PANEL_X + 70, y, 10, statsFedProgress());
+    y += 24;
+    ui().text(Rect{PANEL_X, y, 80, 20}, "energy", TextStyle{0, TextAlign::Left, Color::DarkGray, 1, false, false});
+    drawPips(PANEL_X + 70, y, 5, statsEnergyTier());
+    y += 32;
+
+    snprintf(b, sizeof(b), "Lv %u", stats().level);
+    ui().text(Rect{PANEL_X, y, 100, 24}, b, TextStyle{0, TextAlign::Left, Color::Black, 1, true, false});
+    y += 30;
+
+    snprintf(b, sizeof(b), "approved %u", stats().approvals);
+    ui().text(Rect{PANEL_X, y, PANEL_W, 20}, b, TextStyle{0, TextAlign::Left, Color::DarkGray, 1, false, false});
+    y += 22;
+    snprintf(b, sizeof(b), "denied   %u", stats().denials);
+    ui().text(Rect{PANEL_X, y, PANEL_W, 20}, b, TextStyle{0, TextAlign::Left, Color::DarkGray, 1, false, false});
+    y += 22;
+    uint32_t nap = stats().napSeconds;
+    snprintf(b, sizeof(b), "napped   %luh%02lum", nap / 3600, (nap / 60) % 60);
+    ui().text(Rect{PANEL_X, y, PANEL_W, 20}, b, TextStyle{0, TextAlign::Left, Color::DarkGray, 1, false, false});
+    y += 22;
+    auto tokFmt = [&](const char* label, uint32_t v) {
+      char t[32];
+      if (v >= 1000000) snprintf(t, sizeof(t), "%s%lu.%luM", label, v / 1000000, (v / 100000) % 10);
+      else if (v >= 1000) snprintf(t, sizeof(t), "%s%lu.%luK", label, v / 1000, (v / 100) % 10);
+      else snprintf(t, sizeof(t), "%s%lu", label, v);
+      ui().text(Rect{PANEL_X, y, PANEL_W, 20}, t, TextStyle{0, TextAlign::Left, Color::DarkGray, 1, false, false});
+      y += 22;
+    };
+    tokFmt("tokens   ", stats().tokens);
+    tokFmt("today    ", tama.tokensToday);
+  } else {
+    static const char* const lines[] = {
+      "MOOD", " approve fast = up", " deny lots = down", "",
+      "FED", " 50K tokens = level up", "",
+      "ENERGY", " hold UP to nap, refills", "",
+      "CONFIRM: screens  BACK: page", "hold CONFIRM: menu",
+    };
+    for (const char* l : lines) {
+      if (l[0]) {
+        Color c = (l[0] != ' ') ? Color::Black : Color::DarkGray;
+        ui().text(Rect{PANEL_X, y, PANEL_W, 18}, l, TextStyle{0, TextAlign::Left, c, 1, false, false});
+      }
+      y += 18;
+    }
+  }
+}
+
+static void drawInfoPage(uint32_t now, int16_t y) {
+  char hdr[24];
+  snprintf(hdr, sizeof(hdr), "info  %u/%u", infoPage + 1, INFO_PAGES);
+  ui().text(Rect{PANEL_X, y, PANEL_W, 24}, hdr, TextStyle{0, TextAlign::Left, Color::Black, 1, true, false});
+  y += 32;
+
+  auto ln = [&](Color c, const char* s) {
+    ui().text(Rect{PANEL_X, y, PANEL_W, 20}, s, TextStyle{0, TextAlign::Left, c, 1, false, false});
+    y += 20;
+  };
+  char b[64];
+
+  if (infoPage == 0) {
+    ln(Color::DarkGray, "I watch your Claude desktop");
+    ln(Color::DarkGray, "sessions. I sleep when");
+    ln(Color::DarkGray, "nothing's happening, wake");
+    ln(Color::DarkGray, "when you start working, get");
+    ln(Color::DarkGray, "impatient when approvals");
+    ln(Color::DarkGray, "pile up.");
+    y += 8;
+    ln(Color::Black, "CONFIRM on a prompt");
+    ln(Color::Black, "approves it from here.");
+  } else if (infoPage == 1) {
+    ln(Color::Black, "CONFIRM");
+    ln(Color::DarkGray, "  tap: approve / next screen");
+    ln(Color::DarkGray, "  hold: menu");
+    y += 4;
+    ln(Color::Black, "BACK");
+    ln(Color::DarkGray, "  tap: deny / next page");
+    y += 4;
+    ln(Color::Black, "LEFT / RIGHT");
+    ln(Color::DarkGray, "  scroll transcript");
+    y += 4;
+    ln(Color::Black, "UP");
+    ln(Color::DarkGray, "  tap: refresh screen");
+    ln(Color::DarkGray, "  hold: nap");
+    y += 4;
+    ln(Color::Black, "DOWN (hold)");
+    ln(Color::DarkGray, "  dizzy");
+    y += 4;
+    ln(Color::Black, "POWER");
+    ln(Color::DarkGray, "  tap: screen sleep");
+  } else if (infoPage == 2) {
+    snprintf(b, sizeof(b), "sessions  %u", tama.sessionsTotal); ln(Color::DarkGray, b);
+    snprintf(b, sizeof(b), "running   %u", tama.sessionsRunning); ln(Color::DarkGray, b);
+    snprintf(b, sizeof(b), "waiting   %u", tama.sessionsWaiting); ln(Color::DarkGray, b);
+    y += 8;
+    ln(Color::Black, "LINK");
+    snprintf(b, sizeof(b), "via       %s", dataScenarioName()); ln(Color::DarkGray, b);
+    snprintf(b, sizeof(b), "ble       %s", !bleConnected() ? "-" : bleSecure() ? "encrypted" : "OPEN"); ln(Color::DarkGray, b);
+    uint32_t age = (now - tama.lastUpdated) / 1000;
+    snprintf(b, sizeof(b), "last msg  %lus", (unsigned long)age); ln(Color::DarkGray, b);
+    snprintf(b, sizeof(b), "state     %s", kStateNames[activeState]); ln(Color::DarkGray, b);
+  } else if (infoPage == 3) {
+    PlatformBatteryStatus bat = platformBatteryStatus();
+    snprintf(b, sizeof(b), "%d%%  %s", bat.pct, bat.usb ? "usb" : "battery"); ln(Color::Black, b);
+    snprintf(b, sizeof(b), "%d.%02dV", bat.mV / 1000, (bat.mV % 1000) / 10); ln(Color::DarkGray, b);
+    y += 8;
+    ln(Color::Black, "SYSTEM");
+    if (ownerName()[0]) { snprintf(b, sizeof(b), "owner    %s", ownerName()); ln(Color::DarkGray, b); }
+    uint32_t up = millis() / 1000;
+    snprintf(b, sizeof(b), "uptime   %luh %02lum", up / 3600, (up / 60) % 60); ln(Color::DarkGray, b);
+    snprintf(b, sizeof(b), "heap     %uKB", ESP.getFreeHeap() / 1024); ln(Color::DarkGray, b);
+    snprintf(b, sizeof(b), "character %u/%u", characterIdx + 1, characterCount); ln(Color::DarkGray, b);
+  } else if (infoPage == 4) {
+    bool linked = bleConnected();
+    ln(linked ? Color::Black : Color::DarkGray, linked ? (bleSecure() ? "linked" : "OPEN") : "advertising");
+    snprintf(b, sizeof(b), "%s", btName); ln(Color::Black, b);
+    uint8_t mac[6] = {0};
+    esp_read_mac(mac, ESP_MAC_BT);
+    snprintf(b, sizeof(b), "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    ln(Color::DarkGray, b);
+    y += 8;
+    if (linked) {
+      uint32_t age = (now - tama.lastUpdated) / 1000;
+      snprintf(b, sizeof(b), "last msg  %lus", (unsigned long)age); ln(Color::DarkGray, b);
+    } else {
+      ln(Color::Black, "TO PAIR");
+      ln(Color::DarkGray, "open Claude desktop >");
+      ln(Color::DarkGray, "Developer > Hardware Buddy");
+    }
+  } else {
+    ln(Color::DarkGray, "made by");
+    ln(Color::Black, "Felix Rieseberg");
+    y += 8;
+    ln(Color::DarkGray, "source");
+    ln(Color::Black, "github.com/anthropics");
+    ln(Color::Black, "/claude-desktop-buddy");
+    y += 8;
+    ln(Color::DarkGray, "hardware");
+    ln(Color::Black, "Xteink X4");
+    ln(Color::Black, "ESP32-C3 + SSD1677");
+  }
+}
+
+static void drawPanelBox(int16_t& boxX, int16_t& boxY, int16_t boxW, int16_t boxH) {
+  boxX = (int16_t)((800 - boxW) / 2);
+  boxY = (int16_t)((480 - boxH) / 2);
+  ui().fill(Rect{boxX, boxY, boxW, boxH}, Paint::solid(Color::White), 10);
+  ui().stroke(Rect{boxX, boxY, boxW, boxH}, Paint::solid(Color::Black), 2, 10);
+}
+
+static void drawMenuItem(int16_t x, int16_t y, int16_t w, const char* label, const char* value, bool sel) {
+  char line[48];
+  snprintf(line, sizeof(line), "%s%s", sel ? "> " : "  ", label);
+  ui().text(Rect{x, y, (int16_t)(w - (value ? 100 : 0)), 24}, line,
+            TextStyle{0, TextAlign::Left, sel ? Color::Black : Color::DarkGray, 1, sel, false});
+  if (value) {
+    ui().text(Rect{(int16_t)(x + w - 100), y, 100, 24}, value,
+              TextStyle{0, TextAlign::Right, Color::DarkGray, 1, false, false});
+  }
+}
+
+static void drawMenuFooter(int16_t x, int16_t y, int16_t w) {
+  ui().text(Rect{x, y, w, 20}, "CONFIRM: next   BACK: select",
+            TextStyle{0, TextAlign::Left, Color::DarkGray, 1, false, false});
+}
+
+static void drawMenu() {
+  int16_t boxX, boxY;
+  int16_t boxW = 340, boxH = (int16_t)(20 + MENU_N * 30 + 30);
+  drawPanelBox(boxX, boxY, boxW, boxH);
+  int16_t y = (int16_t)(boxY + 10);
+  for (uint8_t i = 0; i < MENU_N; i++) {
+    const char* value = (i == 4) ? (dataDemo() ? "on" : "off") : nullptr;
+    drawMenuItem((int16_t)(boxX + 12), y, (int16_t)(boxW - 24), menuItems[i], value, i == menuSel);
+    y += 30;
+  }
+  drawMenuFooter((int16_t)(boxX + 12), (int16_t)(y + 4), (int16_t)(boxW - 24));
+}
+
+static void drawSettings() {
+  int16_t boxX, boxY;
+  int16_t boxW = 340, boxH = (int16_t)(20 + SETTINGS_N * 30 + 30);
+  drawPanelBox(boxX, boxY, boxW, boxH);
+  int16_t y = (int16_t)(boxY + 10);
+  Settings& s = settings();
+  char valbuf[24];
+  for (uint8_t i = 0; i < SETTINGS_N; i++) {
+    const char* value = nullptr;
+    if (i == 0) value = s.hud ? "on" : "off";
+    else if (i == 1) value = s.flash ? "on" : "off";
+    else if (i == 2) { snprintf(valbuf, sizeof(valbuf), "%u/%u", characterIdx + 1, characterCount); value = valbuf; }
+    drawMenuItem((int16_t)(boxX + 12), y, (int16_t)(boxW - 24), settingsItems[i], value, i == settingsSel);
+    y += 30;
+  }
+  drawMenuFooter((int16_t)(boxX + 12), (int16_t)(y + 4), (int16_t)(boxW - 24));
+}
+
+static void drawReset(uint32_t now) {
+  int16_t boxX, boxY;
+  int16_t boxW = 340, boxH = (int16_t)(20 + RESET_N * 30 + 30);
+  drawPanelBox(boxX, boxY, boxW, boxH);
+  int16_t y = (int16_t)(boxY + 10);
+  for (uint8_t i = 0; i < RESET_N; i++) {
+    bool armed = (i == resetConfirmIdx) && (int32_t)(now - resetConfirmUntil) < 0;
+    drawMenuItem((int16_t)(boxX + 12), y, (int16_t)(boxW - 24), armed ? "really?" : resetItems[i], nullptr,
+                 i == resetSel);
+    y += 30;
+  }
+  drawMenuFooter((int16_t)(boxX + 12), (int16_t)(y + 4), (int16_t)(boxW - 24));
+}
+
+static void drawPasskey() {
+  ui().fill(Rect{0, 0, 800, 480}, Paint::solid(Color::White));
+  ui().text(Rect{0, 160, 800, 24}, "BLUETOOTH PAIRING",
+            TextStyle{0, TextAlign::Center, Color::DarkGray, 1, false, false});
+  ui().text(Rect{0, 280, 800, 24}, "enter on desktop:",
+            TextStyle{0, TextAlign::Center, Color::DarkGray, 1, false, false});
+  char b[8];
+  snprintf(b, sizeof(b), "%06lu", (unsigned long)blePasskey());
+  ui().text(Rect{0, 210, 800, 40}, b, TextStyle{0, TextAlign::Center, Color::Black, 1, true, false});
+}
+
 static void drawStatusPanel(uint32_t now) {
+  bool passkeyShowing = blePasskey() != 0;
+  overlayOpen = menuOpen || settingsOpen || resetOpen || passkeyShowing;
+
+  if (passkeyShowing) {
+    drawPasskey();
+    return;
+  }
+
   ui().fill(Rect{PANEL_X, 0, PANEL_W, 480}, Paint::solid(Color::White));
 
   int16_t y = 12;
@@ -355,7 +772,10 @@ static void drawStatusPanel(uint32_t now) {
   y += 28;
 
   bool inPrompt = tama.promptId[0] && !responseSent;
-  if (inPrompt) {
+  if (napping) {
+    ui().text(Rect{PANEL_X, y, PANEL_W, 20}, "napping - hold UP to wake",
+              TextStyle{0, TextAlign::Left, Color::DarkGray, 1, false, false});
+  } else if (inPrompt) {
     uint32_t waited = (now - promptArrivedMs) / 1000;
     snprintf(line, sizeof(line), "approve? %lus", (unsigned long)waited);
     ui().text(Rect{PANEL_X, y, PANEL_W, 20}, line, TextStyle{0, TextAlign::Left, Color::Black, 1, false, false});
@@ -369,7 +789,13 @@ static void drawStatusPanel(uint32_t now) {
     y += 22;
     ui().text(Rect{PANEL_X, y, PANEL_W / 2, 20}, "BACK: deny", TextStyle{0, TextAlign::Left, Color::Black, 1, false, false});
     y += 28;
-  } else {
+  } else if (clockActive()) {
+    drawClock(now, y);
+  } else if (displayMode == DISP_PET) {
+    drawPetPage(now, y);
+  } else if (displayMode == DISP_INFO) {
+    drawInfoPage(now, y);
+  } else if (settings().hud) {
     snprintf(line, sizeof(line), "sessions %u  running %u  waiting %u", tama.sessionsTotal, tama.sessionsRunning,
              tama.sessionsWaiting);
     ui().text(Rect{PANEL_X, y, PANEL_W, 20}, line, TextStyle{0, TextAlign::Left, Color::Black, 1, false, false});
@@ -409,39 +835,89 @@ static void drawStatusPanel(uint32_t now) {
   y += 22;
   snprintf(line, sizeof(line), "Lv %u  tokens %lu", stats().level, (unsigned long)stats().tokens);
   ui().text(Rect{PANEL_X, y, PANEL_W, 20}, line, TextStyle{0, TextAlign::Left, Color::DarkGray, 1, false, false});
+
+  // Overlays draw last, on top of whatever the panel is currently showing —
+  // matches the earlier generation's draw order (menu/settings/reset always
+  // on top of INFO/PET/HUD/clock).
+  if (resetOpen) drawReset(now);
+  else if (settingsOpen) drawSettings();
+  else if (menuOpen) drawMenu();
 }
 
-// --- Input mapping ------------------------------------------------------------
-// The X4's InputStyle::XteinkAdcLadder is NOT a 3-button layout like the
-// M5Stick — it's 7 distinct semantic buttons (BACK/CONFIRM/LEFT/RIGHT/UP/
-// DOWN/POWER) off two resistor-ladder ADC pins, decoded by InputManager (see
-// README "Input mapping" for the full verification trail against the SDK
-// headers). Every button does something:
-//   CONFIRM        approve (in a prompt) — otherwise a no-op unless the
-//                  screen is asleep, in which case any button just wakes it
-//   BACK           deny (in a prompt) — same "otherwise" rule as CONFIRM
-//   LEFT / RIGHT   scroll the transcript panel
-//   UP             force a full e-paper refresh now (clears ghosting on
-//                  demand instead of waiting for FULL_REFRESH_INTERVAL_MS)
-//   DOWN           reserved for a short tap; long-press (~800ms) triggers
-//                  "dizzy" — substitute for the M5 build's shake gesture,
-//                  which needed an IMU the X4 does not have
-//                  (BoardConfig::XTEINK_X4 has ImuType::None; confirmed via
-//                  InputManager/BoardConfig, not assumed)
-//   POWER          toggle screen sleep — sleepScreen()/wakeScreen() below
-// Face-down nap (also IMU-driven) is dropped outright rather than remapped —
-// there's no button gesture that means the same thing. See README.
-static void sendCmd(const char* json) {
-  Serial.println(json);
-  size_t n = strlen(json);
-  bleWrite((const uint8_t*)json, n);
-  bleWrite((const uint8_t*)"\n", 1);
+// ---------------------------------------------------------------------------
+// Menu / settings / reset actions — mirrors the earlier generation's
+// menuConfirm()/applySetting()/applyReset().
+// ---------------------------------------------------------------------------
+static void powerOffSequence() {
+  ui().fill(Rect{0, 0, 800, 480}, Paint::solid(Color::White));
+  ui().text(Rect{0, 220, 800, 40}, "powered off - press POWER",
+            TextStyle{0, TextAlign::Center, Color::DarkGray, 1, false, false});
+  display.displayBuffer(EInkDisplay::FULL_REFRESH);
+  // No PMIC hard-off on this board (the earlier generation's
+  // M5.Axp.PowerOff()) — real ESP32 deep sleep, woken by the POWER button,
+  // is the equivalent off state. Does not return.
+  freeink::PowerManager::deepSleepUntilPowerButton();
 }
 
-// Blanks the panel and halts rendering until woken. Mirrors the earlier
-// desktop-buddy generation's "screen auto-powers off, any button wakes it"
-// behavior, given here as an explicit POWER toggle instead of an idle timer
-// (no idle timer exists on this board yet).
+static void menuConfirm() {
+  switch (menuSel) {
+    case 0: settingsOpen = true; menuOpen = false; settingsSel = 0; break;
+    case 1: powerOffSequence(); break;
+    case 2: menuOpen = false; displayMode = DISP_INFO; infoPage = INFO_PG_BUTTONS; break;
+    case 3: menuOpen = false; displayMode = DISP_INFO; infoPage = INFO_PG_CREDITS; break;
+    case 4: dataSetDemo(!dataDemo()); break;
+    case 5: menuOpen = false; break;
+  }
+}
+
+static void applySetting(uint8_t idx) {
+  Settings& s = settings();
+  switch (idx) {
+    case 0: s.hud = !s.hud; break;
+    case 1: s.flash = !s.flash; break;
+    case 2: nextCharacter(); return;
+    case 3: resetOpen = true; resetSel = 0; resetConfirmIdx = 0xFF; return;
+    case 4: settingsOpen = false; return;
+  }
+  settingsSave();
+}
+
+// Tap-twice confirm: first tap arms (label flips to "really?"), second
+// within 3s executes.
+static void applyReset(uint8_t idx, uint32_t now) {
+  if (idx == 2) { resetOpen = false; return; }  // back
+
+  bool armed = (resetConfirmIdx == idx) && (int32_t)(now - resetConfirmUntil) < 0;
+  if (!armed) {
+    resetConfirmIdx = idx;
+    resetConfirmUntil = now + 3000;
+    return;
+  }
+
+  if (idx == 0) {
+    // delete char: stop using the current SD character, fall back to bufo.
+    // Unlike the earlier generation (which owned its LittleFS /characters/
+    // storage and wiped it), this never deletes files from the SD card —
+    // that's user media the firmware doesn't own.
+    applyCharacter(0);
+    characterIdxSave(0);
+  } else {
+    // factory reset: NVS namespace wipe (stats, owner, petname, settings,
+    // character choice) + BLE bonds. No filesystem to format — SD content
+    // is user media, untouched.
+    _prefs.begin("buddy", false);
+    _prefs.clear();
+    _prefs.end();
+    bleClearBonds();
+    delay(300);
+    ESP.restart();
+  }
+  resetOpen = false;
+}
+
+// ---------------------------------------------------------------------------
+// Screen sleep (POWER button).
+// ---------------------------------------------------------------------------
 static void sleepScreen(uint32_t now) {
   screenAwake = false;
   ui().fill(Rect{0, 0, 800, 480}, Paint::solid(Color::White));
@@ -451,10 +927,6 @@ static void sleepScreen(uint32_t now) {
   lastFullRefreshMs = now;
 }
 
-// lastSpriteDrawMs is reset so renderSprite()'s per-state cadence gate
-// (e.g. P_IDLE's 1500ms check) doesn't skip this draw just because it
-// last ran shortly before sleepScreen() — without that reset the forced
-// FULL_REFRESH below could push a stale/blank sprite region.
 static void wakeScreen(uint32_t now) {
   screenAwake = true;
   stateEnteredMs = now;
@@ -466,20 +938,133 @@ static void wakeScreen(uint32_t now) {
   lastFullRefreshMs = now;
 }
 
-static uint32_t downPressStart = 0;
-static bool     downLongFired = false;
+// ---------------------------------------------------------------------------
+// Nap (UP long-press) — substitutes for the earlier generation's face-down
+// detection, which needed an IMU this board doesn't have (per the
+// AskUserQuestion decision recorded in README "Known limitations": map nap
+// to a button instead of dropping it).
+// ---------------------------------------------------------------------------
+static void toggleNap(uint32_t now) {
+  if (!napping) {
+    napping = true;
+    napStartMs = now;
+    napFrameDrawn = false;
+  } else {
+    napping = false;
+    statsOnNapEnd((now - napStartMs) / 1000);
+    statsOnWake();
+    stateEnteredMs = now;
+    sleepFrameDrawn = false;
+    lastSpriteDrawMs = 0;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Input mapping ---------------------------------------------------------------
+// The X4's InputStyle::XteinkAdcLadder is NOT a 3-button layout like the
+// earlier M5-based generation — it's 7 distinct semantic buttons (BACK/
+// CONFIRM/LEFT/RIGHT/UP/DOWN/POWER) off two resistor-ladder ADC pins,
+// decoded by InputManager (see README "Input mapping" for the full
+// verification trail against the SDK headers).
+//
+// CONFIRM and BACK mirror that generation's BtnA/BtnB roles as closely as
+// this board's buttons allow: CONFIRM tap = approve / advance selection /
+// cycle screen (BtnA tap); CONFIRM hold (~600ms) = open menu, closing any
+// nested overlay first (hold-A); BACK tap = deny / act on the highlighted
+// item / next page (BtnB tap). The extra buttons this board has beyond
+// A/B get used for things that generation didn't have a control for:
+//   LEFT / RIGHT   scroll the transcript panel
+//   UP             tap: force a full e-paper refresh now
+//                  hold (~800ms): toggle nap
+//   DOWN           hold (~800ms): trigger "dizzy" — substitute for shake
+//                  (BoardConfig::XTEINK_X4 has NO_SENSORS; confirmed via
+//                  BoardConfig, not assumed)
+//   POWER          toggle screen sleep — sleepScreen()/wakeScreen() above
+// ---------------------------------------------------------------------------
+struct HoldButton {
+  uint32_t pressStart = 0;
+  bool     longFired = false;
+  bool     wasDown = false;
+};
+// Returns 1 on a tap (released before holdMs), 2 the instant holdMs is
+// crossed while still held, 0 otherwise.
+static uint8_t pollHold(HoldButton& hb, bool down, uint32_t now, uint32_t holdMs) {
+  uint8_t result = 0;
+  if (down && !hb.wasDown) { hb.pressStart = now; hb.longFired = false; }
+  if (down && !hb.longFired && now - hb.pressStart >= holdMs) { hb.longFired = true; result = 2; }
+  if (!down && hb.wasDown && !hb.longFired) result = 1;
+  hb.wasDown = down;
+  return result;
+}
+
+static HoldButton confirmHold, upHold, downHold;
+
+static void dispatchConfirmHold() {
+  if (resetOpen) resetOpen = false;
+  else if (settingsOpen) settingsOpen = false;
+  else { menuOpen = !menuOpen; menuSel = 0; }
+  needsRedraw = true;
+}
+
+static void dispatchConfirmTap(uint32_t now) {
+  bool inPrompt = tama.promptId[0] && !responseSent;
+  if (inPrompt) {
+    char cmd[96];
+    snprintf(cmd, sizeof(cmd), "{\"cmd\":\"permission\",\"id\":\"%s\",\"decision\":\"once\"}", tama.promptId);
+    sendCmd(cmd);
+    responseSent = true;
+    uint32_t tookS = (now - promptArrivedMs) / 1000;
+    statsOnApproval(tookS);
+    if (tookS < 5) triggerOneShot(P_HEART, 2000);
+  } else if (resetOpen) {
+    resetSel = (resetSel + 1) % RESET_N;
+    resetConfirmIdx = 0xFF;
+  } else if (settingsOpen) {
+    settingsSel = (settingsSel + 1) % SETTINGS_N;
+  } else if (menuOpen) {
+    menuSel = (menuSel + 1) % MENU_N;
+  } else {
+    displayMode = (DisplayMode)((displayMode + 1) % DISP_COUNT);
+  }
+  needsRedraw = true;
+}
+
+static void dispatchBack(uint32_t now) {
+  bool inPrompt = tama.promptId[0] && !responseSent;
+  if (inPrompt) {
+    char cmd[96];
+    snprintf(cmd, sizeof(cmd), "{\"cmd\":\"permission\",\"id\":\"%s\",\"decision\":\"deny\"}", tama.promptId);
+    sendCmd(cmd);
+    responseSent = true;
+    statsOnDenial();
+  } else if (resetOpen) {
+    applyReset(resetSel, now);
+  } else if (settingsOpen) {
+    applySetting(settingsSel);
+  } else if (menuOpen) {
+    menuConfirm();
+  } else if (displayMode == DISP_INFO) {
+    infoPage = (infoPage + 1) % INFO_PAGES;
+  } else if (displayMode == DISP_PET) {
+    petPage = (petPage + 1) % PET_PAGES;
+  } else {
+    uint8_t maxOffset = tama.nLines > TRANSCRIPT_VISIBLE ? tama.nLines - TRANSCRIPT_VISIBLE : 0;
+    transcriptOffset = (transcriptOffset >= maxOffset) ? 0 : transcriptOffset + 1;
+  }
+  needsRedraw = true;
+}
 
 // InputManager runs on a background FreeRTOS task (input.beginAsync() in
 // setup()), not on our own polling here — required because
 // display.displayWindow()/displayBuffer() block the main loop for
 // anywhere from ~50ms (a small partial) to ~2s (a full refresh, per
-// FreeInkDisplay's own docs), and a CONFIRM/BACK press-and-release that
-// happens entirely inside one of those blocking calls would otherwise
-// never be seen. The async task calls update() itself, so isPressed()
-// (a plain level read of the task's currentState) is still safe to read
-// from here for the DOWN long-press check below — see InputManager.cpp's
-// asyncPoll(). Only wasPressed()/update() are unsafe to call ourselves
-// once async polling owns the edge state; edges come from popPress().
+// FreeInkDisplay's own docs), and a press-and-release that happens
+// entirely inside one of those blocking calls would otherwise never be
+// seen. The async task calls update() itself, so isPressed() (a plain
+// level read of the task's currentState) is still safe to read from here
+// — see InputManager.cpp's asyncPoll(). Only wasPressed()/update() are
+// unsafe to call ourselves once async polling owns the edge state; edges
+// come from popPress().
 static void handleInput(uint32_t now) {
   if (!screenAwake) {
     // Any press just wakes the screen — never doubles as that button's
@@ -489,79 +1074,56 @@ static void handleInput(uint32_t now) {
     bool anyPress = false;
     while (input.popPress(btn)) anyPress = true;
     if (anyPress) wakeScreen(now);
-    downPressStart = 0;
-    downLongFired = false;
+    confirmHold = HoldButton{};
+    upHold = HoldButton{};
+    downHold = HoldButton{};
     return;
   }
 
+  // BACK/LEFT/RIGHT/POWER: plain press-edge actions, no hold behavior.
+  // CONFIRM/UP/DOWN edges are drained here too (silently — they're handled
+  // below via level-polling so tap and hold can be told apart).
   uint8_t btn;
   while (input.popPress(btn)) {
-    bool inPrompt = tama.promptId[0] && !responseSent;  // re-checked per event: the
-                                                         // first popped press in a
-                                                         // burst can flip responseSent
-    if (btn == InputManager::BTN_CONFIRM && inPrompt) {
-      char cmd[96];
-      snprintf(cmd, sizeof(cmd), "{\"cmd\":\"permission\",\"id\":\"%s\",\"decision\":\"once\"}", tama.promptId);
-      sendCmd(cmd);
-      responseSent = true;
-      uint32_t tookS = (now - promptArrivedMs) / 1000;
-      statsOnApproval(tookS);
-      if (tookS < 5) triggerOneShot(P_HEART, 2000);
-    } else if (btn == InputManager::BTN_BACK && inPrompt) {
-      char cmd[96];
-      snprintf(cmd, sizeof(cmd), "{\"cmd\":\"permission\",\"id\":\"%s\",\"decision\":\"deny\"}", tama.promptId);
-      sendCmd(cmd);
-      responseSent = true;
-      statsOnDenial();
+    if (btn == InputManager::BTN_BACK) {
+      dispatchBack(now);
     } else if (btn == InputManager::BTN_LEFT) {
       if (transcriptOffset > 0) transcriptOffset--;
+      needsRedraw = true;
     } else if (btn == InputManager::BTN_RIGHT) {
       uint8_t maxOffset = tama.nLines > TRANSCRIPT_VISIBLE ? tama.nLines - TRANSCRIPT_VISIBLE : 0;
       if (transcriptOffset < maxOffset) transcriptOffset++;
-    } else if (btn == InputManager::BTN_UP) {
-      display.displayBuffer(EInkDisplay::FULL_REFRESH);
-      lastFullRefreshMs = now;
+      needsRedraw = true;
     } else if (btn == InputManager::BTN_POWER) {
       sleepScreen(now);
       return;  // screen is asleep now; the rest of this batch no longer applies
     }
   }
 
-  // DOWN long-press: dizzy substitute for shake (see comment above).
-  if (input.isPressed(InputManager::BTN_DOWN)) {
-    if (downPressStart == 0) downPressStart = now;
-    if (!downLongFired && now - downPressStart > 800 && (int32_t)(now - oneShotUntil) >= 0) {
-      downLongFired = true;
-      triggerOneShot(P_DIZZY, 2000);
-    }
-  } else {
-    downPressStart = 0;
-    downLongFired = false;
-  }
-}
+  uint8_t r;
+  r = pollHold(confirmHold, input.isPressed(InputManager::BTN_CONFIRM), now, 600);
+  if (r == 1) dispatchConfirmTap(now);
+  else if (r == 2) dispatchConfirmHold();
 
-// ---------------------------------------------------------------------------
-// Scans /characters for the first *.charpack file and opens it, replacing
-// the compiled-in bufo icons for every state. No selection UI yet — see
-// README.md "SD-backed character packs" for why (v1 scope: this is the
-// CrossPoint SdCardFontSystem "manual SD copy" install path, not the BLE
-// push path — the SD card just needs one .charpack file on it).
-static void loadSdCharacterIfPresent() {
-  if (!SdMan.ready()) return;
-  for (const String& name : SdMan.listFiles("/characters")) {
-    if (!name.endsWith(".charpack")) continue;
-    String path = "/characters/" + name;
-    if (sdPack.open(path.c_str())) {
-      sdCharacterActive = true;
-      Serial.printf("[sd] loaded character pack %s\n", path.c_str());
-    }
-    return;  // first *.charpack wins, found or not — don't keep scanning
+  r = pollHold(upHold, input.isPressed(InputManager::BTN_UP), now, 800);
+  if (r == 1) {
+    display.displayBuffer(EInkDisplay::FULL_REFRESH);
+    lastFullRefreshMs = now;
+  } else if (r == 2) {
+    toggleNap(now);
+    needsRedraw = true;
+  }
+
+  r = pollHold(downHold, input.isPressed(InputManager::BTN_DOWN), now, 800);
+  if (r == 2 && !napping && (int32_t)(now - oneShotUntil) >= 0) {
+    triggerOneShot(P_DIZZY, 2000);
   }
 }
 
 void setup() {
   Serial.begin(115200);
   statsLoad();
+  settingsLoad();
   petNameLoad();
 
   // X3/X4 share the display's SPI bus with the SD card slot (BoardConfig::
@@ -586,15 +1148,15 @@ void setup() {
   display.displayBuffer(EInkDisplay::FULL_REFRESH);
   lastFullRefreshMs = millis();
 
-  SdMan.begin();  // false if no card present — loadSdCharacterIfPresent() below no-ops either way
-  loadSdCharacterIfPresent();
+  SdMan.begin();  // false if no card present — scanCharacters() below no-ops either way
+  scanCharacters();
+  applyCharacter(characterIdxLoad());
 
   input.begin();
   input.beginAsync();  // see handleInput()'s comment for why this is required
 
   uint8_t mac[6] = {0};
   esp_read_mac(mac, ESP_MAC_BT);
-  static char btName[16];
   snprintf(btName, sizeof(btName), "Claude-%02X%02X", mac[4], mac[5]);
   bleInit(btName);
 
@@ -629,8 +1191,12 @@ void loop() {
 
   baseState = derive(tama);
   if ((int32_t)(now - oneShotUntil) >= 0) activeState = baseState;
+  if (clockActive()) {
+    struct tm lt;
+    if (getSoftClock(lt, now)) applyClockMood(lt, now);
+  }
 
-  static PersonaState lastRenderedState = P_COUNT;  // force first-tick transition
+  static PersonaState lastRenderedState = P_COUNT;
   if (activeState != lastRenderedState) {
     stateEnteredMs = now;
     sleepFrameDrawn = false;
@@ -646,22 +1212,29 @@ void loop() {
   // which pushes the whole framebuffer — the panel text must already be
   // current in it when that happens, not from a stale previous tick.
   drawStatusPanel(now);
-  renderSprite(now);
+  if (napping) renderNapFrame();
+  else renderSprite(now);
 
   // Mandatory DC-balance full refresh, independent of activity/state.
   if (now - lastFullRefreshMs > FULL_REFRESH_INTERVAL_MS) {
     display.displayBuffer(EInkDisplay::FULL_REFRESH);
     lastFullRefreshMs = now;
+    needsRedraw = false;
   } else if (activeState != P_CELEBRATE) {
     // The status panel is drawn every tick above but only pushed to the
     // panel when something in it can plausibly have changed, to avoid
     // hammering the (still-visible) partial-refresh region with redundant
-    // waveforms. displayWindow() over the panel's own rect keeps this
-    // independent of the sprite region's refresh cadence.
+    // waveforms — except when an input action set needsRedraw, which
+    // bypasses the throttle so menu navigation feels immediate. Overlays
+    // (menu/settings/reset/passkey) span the sprite region too, so they
+    // get the full 800x480 window instead of just the panel's rect.
     static uint32_t lastPanelDrawMs = 0;
-    if (now - lastPanelDrawMs > 1000) {
-      display.displayWindow(PANEL_X, 0, 800 - PANEL_X, 480);
+    bool due = needsRedraw || (now - lastPanelDrawMs > 1000);
+    if (due) {
+      if (overlayOpen) display.displayWindow(0, 0, 800, 480);
+      else display.displayWindow(PANEL_X, 0, 800 - PANEL_X, 480);
       lastPanelDrawMs = now;
+      needsRedraw = false;
     }
   }
 

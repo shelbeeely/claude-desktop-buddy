@@ -103,17 +103,24 @@ If discovery isn't finding the device:
 
 ## Controls
 
-Per the seven-button ADC ladder above, there's a 1:1 mapping with no
-combining required. Every button does something:
+This firmware aims to match the earlier M5StickCPlus-based desktop-buddy's
+button semantics as closely as this board's very different button set
+allows: `CONFIRM` and `BACK` play the same roles that generation's two
+physical buttons (`A`/`B`) did — tap `CONFIRM` to advance/approve, hold it
+to open the menu; tap `BACK` to act/deny. The X4's extra buttons
+(`LEFT`/`RIGHT`/`UP`/`DOWN`/`POWER`) cover things that generation had no
+spare button for.
 
-| Button                       | Normal                                        | On an approval prompt |
-| ----------------------------- | ---------------------------------------------- | ---------------------- |
-| `CONFIRM`                     | no-op (or wakes the screen if it's asleep)     | **approve**             |
-| `BACK`                        | no-op (or wakes the screen if it's asleep)     | **deny**                |
-| `LEFT` / `RIGHT`               | scroll the transcript panel                    | —                        |
-| `UP`                           | force a full e-paper refresh now (clears ghosting on demand instead of waiting for the 5-minute timer) | —                        |
-| `DOWN` (long-press, ~800ms)    | trigger `dizzy` for 2s — the closest substitute for a shake gesture, since the X4 has no IMU | —                        |
-| `POWER`                        | toggle screen sleep — blanks the panel and halts rendering; any button press wakes it | —                        |
+| Button                    | Normal                                                                    | On an approval prompt |
+| -------------------------- | -------------------------------------------------------------------------- | ---------------------- |
+| `CONFIRM` tap               | advance selection in a menu, else cycle screen (home → pet → info)         | **approve**             |
+| `CONFIRM` hold (~600ms)     | open the menu; closes a nested settings/reset panel first if one is open   | —                        |
+| `BACK` tap                  | act on the highlighted menu item, else next page/scroll transcript         | **deny**                |
+| `LEFT` / `RIGHT`            | scroll the transcript panel                                                | —                        |
+| `UP` tap                    | force a full e-paper refresh now (clears ghosting instead of waiting for the 5-minute timer) | —          |
+| `UP` hold (~800ms)          | toggle nap — pauses the pet and accumulates nap time, same mechanic as the earlier generation's face-down nap | —          |
+| `DOWN` hold (~800ms)        | trigger `dizzy` for 2s — the closest substitute for a shake gesture, since the X4 has no IMU | —          |
+| `POWER` tap                 | toggle screen sleep — blanks the panel and halts rendering; any button press wakes it | —          |
 
 A sleeping screen always just wakes on the first press — that press never
 also fires the button's normal action, so waking the device can't
@@ -143,8 +150,59 @@ task owns the edge state.
 | `busy`      | sessions actively running   | sweating, working           |
 | `attention` | approval pending            | alert, bit-inverted blink   |
 | `celebrate` | level up (every 50K tokens) | confetti, bouncing          |
-| `dizzy`     | `DOWN` long-pressed          | spiral eyes, wobbling        |
+| `dizzy`     | `DOWN` held                 | spiral eyes, wobbling        |
 | `heart`     | approved in under 5s        | floating hearts             |
+
+## Menu system
+
+The status panel has three screens (`CONFIRM` tap cycles through them),
+plus a menu/settings/reset overlay stack on top — the same structure the
+earlier M5-based generation used, adapted to this board's buttons and
+single fixed panel (there's no "peek" scaling: the pet sprite keeps
+animating in its own region regardless of which screen is showing beside
+it).
+
+- **home** — session counts, the latest message, and a scrollable
+  transcript (`LEFT`/`RIGHT`), or the approval prompt when one's pending.
+- **pet** — two pages (`BACK` cycles them): mood/fed/energy pips, level,
+  approvals/denials/nap time/tokens; then a how-to page.
+- **info** — six pages (`BACK` cycles them): about, button reference,
+  Claude session/link status, device/battery status, Bluetooth pairing
+  info, and credits.
+
+Holding `CONFIRM` opens the **menu** (`settings`, `turn off`, `help`,
+`about`, `demo`, `close`) — `CONFIRM` taps advance the selection, `BACK`
+acts on it, matching the earlier generation's `A`-advances/`B`-selects
+pattern exactly. `settings` opens a submenu (`hud`, `flash`, `character`,
+`reset`, `back`): `hud` toggles the home screen's session/transcript
+content, `flash` toggles the bit-inverted blink during `attention` (the
+substitute for that generation's LED), `character` cycles through the
+compiled-in `bufo` plus every `.charpack` found on the SD card at boot
+(persisted to NVS). `reset` opens a tap-twice-to-confirm submenu:
+`delete char` reverts to the compiled-in `bufo` (without touching the SD
+card's files — unlike the earlier generation, this firmware doesn't own
+that storage), and `factory reset` clears NVS (stats, owner, pet name,
+settings, character choice) and BLE bonds, then restarts.
+
+**Turn off** puts the device into real ESP32 deep sleep
+(`PowerManager::deepSleepUntilPowerButton()`), woken by the `POWER`
+button — this board has no PMIC hard-off like the earlier generation's
+AXP192, so deep sleep is the equivalent off state.
+
+**Clock face.** With no RTC, there's nowhere to persist wall-clock time
+across a reboot — but `platformTimeSync()` (`main.cpp`) keeps a software
+clock in RAM: one synced moment (from the bridge's `time` heartbeat) plus
+the `millis()` it arrived at, with "now" derived by adding elapsed time on
+every read. When nothing's happening (home screen, no sessions, no
+overlay open, on USB power, and the clock has synced at least once since
+boot), the home screen shows this clock instead of session info, and the
+pet's mood follows the same hour-of-day/weekday table the earlier
+generation used (a pure function of the time, so it needed no changes).
+
+**Nap** (`UP` held) is this board's substitute for that generation's
+face-down-to-nap gesture, which needed an IMU this board doesn't have —
+see "Known limitations". It pauses the pet's animation and accumulates nap
+time toward the same stat the gesture did; holding `UP` again ends it.
 
 ### Sprite region and refresh strategy
 
@@ -258,13 +316,15 @@ python3 tools/gif_to_icons.py characters/bufo \
   --sd-out characters/bufo/bufo.charpack
 ```
 
-**Install:** copy the `.charpack` file to `/characters/` on the SD card and
-insert it — no rebuild needed. This is deliberately the same shape as
+**Install:** copy the `.charpack` file(s) to `/characters/` on the SD card
+and insert it — no rebuild needed. This is deliberately the same shape as
 [CrossPoint's SD-card-font install](https://github.com/crosspoint-reader/crosspoint-reader/blob/main/docs/sd-card-fonts.md#option-3-manual-sd-card-copy):
 discovered and loaded at boot, not pushed over BLE (see below). `main.cpp`'s
-`loadSdCharacterIfPresent()` scans `/characters` for the first `*.charpack`
-file and opens it; if none is found, or there's no SD card, it falls back to
-the compiled-in `bufo` automatically.
+`scanCharacters()` enumerates every `*.charpack` file under `/characters`
+alongside the compiled-in `bufo`; Settings > `character` cycles between
+them (see "Menu system"), and the choice persists to NVS across reboots. No
+SD card, or none found — it falls back to the compiled-in `bufo`
+automatically.
 
 **Format** (`src/sd_character_pack.h`/`.cpp`, generated by the same
 `write_charpack()` that produces the `.h` from identical per-frame data —
@@ -296,14 +356,13 @@ frames, that reopen is well inside the frame budget).
 SD; the manual-copy path above is the only install method right now — see
 "Known limitations" below. There's also no runtime check that an SD pack's
 frame dimensions fit the sprite region (`SPRITE_W`×`SPRITE_H`, 240×260) —
-pick `--scale` to match, same constraint as the compiled-in asset — and no
-multi-pack selection UI: the first `*.charpack` found wins.
+pick `--scale` to match, same constraint as the compiled-in asset.
 
 ## Resource budget
 
 ```
-RAM:   [==        ]  15.2% (used 49652 bytes from 327680 bytes)
-Flash: [==        ]  21.6% (used 1414257 bytes from 6553600 bytes)
+RAM:   [==        ]  15.5% (used 50748 bytes from 327680 bytes)
+Flash: [==        ]  22.0% (used 1443631 bytes from 6553600 bytes)
 ```
 
 From `pio run -e xteink_x4`'s size report (ESP32-C3, `default_16MB.csv`
@@ -323,13 +382,24 @@ here rather than eating into that ~278KB at runtime.
 
 ## Known limitations
 
-- No shake gesture — the X4 has no IMU. `DOWN` long-press substitutes for
-  triggering `dizzy`.
-- No face-down nap detection — same reason, and no equivalent gesture is
-  mapped in its place.
-- No wall-clock time across reboots — the X4 has no RTC. `platformTimeSync()`
-  in `main.cpp` is a real hook (called whenever the bridge sends a time
-  sync) but currently a no-op with nowhere to persist the result.
+- No shake gesture — the X4 has no IMU. `DOWN` held substitutes for
+  triggering `dizzy`; face-down nap detection is similarly replaced with
+  `UP` held (see "Menu system" > "Nap") rather than dropped outright.
+- No wall-clock time across reboots — the X4 has no RTC, so the clock face
+  (see "Menu system") runs on a software clock that resets to unsynced on
+  every boot until the bridge sends its next `time` heartbeat, and drifts
+  with `millis()` between syncs rather than ticking off real hardware time.
+- No buzzer, no LED, no brightness/frontlight control — the X4's
+  `BoardConfig` profile declares `NO_AUDIO`, `NO_LEDS`, and `NO_FRONTLIGHT`.
+  There's no substitute for these; the earlier generation's sound feedback
+  and brightness setting are dropped rather than faked.
+- The 18 hand-tuned ASCII-species characters from the earlier generation
+  aren't ported — they were pixel-position-tuned text art for a 135×240
+  color LCD at 5fps, and re-tuning all of them for 800×480 monochrome
+  e-paper's much slower partial-refresh cadence would be a from-scratch
+  effort per species. This board's answer to "multiple characters" is the
+  compiled-in `bufo` plus SD `.charpack` cycling instead (see "SD-backed
+  character packs" and "Menu system").
 - Battery status's charge current (`mA`) always reads `0` — the X4 has no
   charge-status pin to read it from.
 - Battery status's `usb` flag reads `BoardConfig::ACTIVE.usbDetect`
