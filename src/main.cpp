@@ -1272,6 +1272,16 @@ static void handleInput(uint32_t now) {
 }
 
 void setup() {
+  // Must run before anything else: M5Paper latches its own power through a
+  // MOSFET on GPIO2 (BoardConfig.h M5PAPER_V11 power.latch0) — if it isn't
+  // driven HIGH within the first few ms of boot, the board powers off the
+  // instant USB is unplugged (freeink-sdk platformio.sample.ini "POWER
+  // LATCH" comment, BoardConfig.h:1173-1178). holdPowerRails() is a runtime
+  // no-op on every other board here (X3/X4/X4 Pro have PIN_UNASSIGNED
+  // latch pins — BoardConfig.h:1667-1670), so this is safe to call
+  // unconditionally rather than needing a per-board #ifdef.
+  BoardConfig::holdPowerRails();
+
   Serial.begin(115200);
   statsLoad();
   settingsLoad();
