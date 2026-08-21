@@ -9,18 +9,21 @@
 // settings menu cycle between them — see README.md "SD-backed character
 // packs" and "Menu system".
 //
-// This one file drives three boards, two of which (X4, X3) share one
+// This one file drives four boards, two of which (X4, X3) share one
 // ESP32-C3 binary (env:xteink) picked at runtime by freeink::
-// selectXteinkDevice() in setup(); the third (X4 Pro) is ESP32-S3 and
-// builds separately (env:xteink_x4pro) but runs the same source. Where a
-// board has real hardware the M5-era original also had (X3's IMU/RTC/
-// battery gauge, X4 Pro's touch/frontlight/RTC/gauge), this file uses it via
-// BoardConfig::hasImu()/hasRtc()/isX4Pro() and the Imu/Rtc/FrontlightManager
-// libraries; where a board has none of it (X4: BoardConfig::XTEINK_X4 is
-// NO_SENSORS/NO_AUDIO/NO_LEDS/NO_FRONTLIGHT, no RTC), the same button/
-// software substitutes from the X4-only version remain. See README.md
-// "Multi-board support" for the full capability matrix, and "Menu system"
-// for what's substituted versus real per board.
+// selectXteinkDevice() in setup(); X4 Pro and M5Stack PaperS3 are each their
+// own ESP32-S3 binary (env:xteink_x4pro, env:papers3) but run the same
+// source. Where a board has real hardware the M5-era original also had
+// (X3's IMU/RTC/battery gauge, X4 Pro's touch/frontlight/RTC/gauge,
+// PaperS3's touch/RTC), this file uses it via
+// BoardConfig::hasImu()/hasRtc()/isX4Pro()/isM5PaperS3() and the Imu/Rtc/
+// FrontlightManager libraries; where a board has none of it (X4:
+// BoardConfig::XTEINK_X4 is NO_SENSORS/NO_AUDIO/NO_LEDS/NO_FRONTLIGHT, no
+// RTC), the same button/software substitutes from the X4-only version
+// remain. See README.md "Multi-board support" for the full capability
+// matrix, and "Menu system" for what's substituted versus real per board.
+// PaperS3 has NO physical buttons at all — see the "PaperS3 touch-only
+// navigation" block near handleInput() below and docs/board-notes/papers3.md.
 //
 // See README.md for the sprite-region size, the full-refresh timer
 // interval, and the full input mapping.
@@ -41,6 +44,12 @@
 #include <Rtc.h>
 #include <FrontlightManager.h>
 #include <SPI.h>
+#if FREEINK_DEVICE_PAPERS3
+// Board-support header (pins + BoardPaperS3::powerOff()), only linked into
+// [env:papers3] — see powerOffSequence() below for why this board can't
+// reuse the generic PowerManager deep-sleep-until-POWER-press path.
+#include <BoardPaperS3.h>
+#endif
 
 #include "ble_bridge.h"
 #include "data.h"
@@ -773,7 +782,7 @@ static void drawInfoPage(uint32_t now, int16_t y) {
     y += 8;
     ln(Color::DarkGray, "hardware");
     ln(Color::Black, BoardConfig::ACTIVE.name);
-    ln(Color::Black, BoardConfig::isX4Pro() ? "ESP32-S3" : "ESP32-C3");
+    ln(Color::Black, (BoardConfig::isX4Pro() || BoardConfig::isM5PaperS3()) ? "ESP32-S3" : "ESP32-C3");
   }
 }
 
@@ -960,6 +969,29 @@ static void drawStatusPanel(uint32_t now) {
 // ---------------------------------------------------------------------------
 static void powerOffSequence() {
   ui().fill(Rect{0, 0, PANEL_TOTAL_W, PANEL_TOTAL_H}, Paint::solid(Color::White));
+#if FREEINK_DEVICE_PAPERS3
+  // PaperS3 has no POWER GPIO at all (BoardConfig::M5PAPER_S3.input.power is
+  // PIN_UNASSIGNED — freeink-sdk/libs/hardware/BoardConfig/include/
+  // BoardConfig.h:1265-1266) and its side button self-latches into a
+  // PMS150G chip, not an ESP32 GPIO PowerManager can arm an interrupt
+  // wakeup on. PowerManager::armPowerButtonWakeup() silently returns false
+  // with NO wake source armed when powerPin() < 0 (freeink-sdk/libs/
+  // hardware/PowerManager/src/PowerManager.cpp:36-45), and
+  // deepSleepUntilPowerButton() never checks that return value before
+  // deep-sleeping anyway — reusing it here would strand this board in deep
+  // sleep with nothing to wake it, until a physical reflash. Use the real
+  // board power-off instead (a GPIO44 pulse to the latch chip; BoardConfig.h
+  // :1246, freeink-sdk/libs/hardware/BoardPaperS3/include/BoardPaperS3.h).
+  // #if-guarded (not a runtime check) because the BoardPaperS3 library —
+  // like PaperMono's board-support call in InputManager.cpp's
+  // updateDigitalTwoButton() — is only linked into this device's env; see
+  // platformio.ini's [env:papers3].
+  ui().text(Rect{0, (int16_t)(PANEL_TOTAL_H / 2 - 20), PANEL_TOTAL_W, 40}, "powering off...",
+            TextStyle{0, TextAlign::Center, Color::DarkGray, 1, false, false});
+  display.displayBuffer(EInkDisplay::FULL_REFRESH);
+  BoardPaperS3::powerOff();  // does not return on battery power
+  return;                    // on USB the board can brown back up instead (see powerOff()'s doc comment)
+#else
   ui().text(Rect{0, (int16_t)(PANEL_TOTAL_H / 2 - 20), PANEL_TOTAL_W, 40}, "powered off - press POWER",
             TextStyle{0, TextAlign::Center, Color::DarkGray, 1, false, false});
   display.displayBuffer(EInkDisplay::FULL_REFRESH);
@@ -967,6 +999,7 @@ static void powerOffSequence() {
   // M5.Axp.PowerOff()) — real ESP32 deep sleep, woken by the POWER button,
   // is the equivalent off state. Does not return.
   freeink::PowerManager::deepSleepUntilPowerButton();
+#endif
 }
 
 static void menuConfirm() {
@@ -1175,6 +1208,140 @@ static void dispatchBack(uint32_t now) {
   needsRedraw = true;
 }
 
+// =============================================================================
+// PaperS3 touch-only navigation — SELF-CONTAINED BLOCK, start.
+//
+// PaperS3 (M5Stack PaperS3) is the only board this firmware supports with NO
+// firmware-readable buttons at all: BoardConfig::M5PAPER_S3 leaves every
+// InputPins field PIN_UNASSIGNED (freeink-sdk/libs/hardware/BoardConfig/
+// include/BoardConfig.h:1265-1266), sets touch.synthesizeConfirm=false
+// (:1277-1279) — so serviceTouch() never synthesizes a BTN_CONFIRM edge the
+// way it does on boards that opt into that — and sets no
+// touch.hasHomeKey (defaults false; contrast X4 Pro, :1447) — so there is no
+// capacitive Home key either. The side button self-latches into a PMS150G
+// power chip before firmware ever runs (:1242-1246) — it is not a GPIO this
+// firmware can read. Concretely: everywhere else in this file, CONFIRM/BACK
+// come from real button edges (popPress()/isPressed()) or, on X4 Pro, from
+// the capacitive Home key (wasHomeKeyTapped()) — PaperS3 has neither, so it
+// needs its own tap-zone dispatch reading GT911 touch positions directly.
+//
+// touchOnlyNavActive() is a CAPABILITY check (touch present, no synthesized
+// CONFIRM, no Home key, no physical confirm pin), not an identity check like
+// isX4Pro()/isM5PaperS3() used elsewhere in this file — written this way so
+// it stays correct (and this block stays inert) should a future board share
+// PaperS3's "touch is the only input" shape without being PaperS3 itself.
+//
+// Zone layout — normalized touch coordinates (nx,ny in 0..1, the touch
+// controller's post-swapXY/flip "panel-native" frame InputManager already
+// corrects into; see InputManager::wasTouchTap's doc comment and
+// BoardConfig.h:503-509). BoardConfig.h:1248-1253 flags PaperS3's panel
+// rotation AND its touch swapXY/flip pairing as both PENDING HARDWARE
+// VALIDATION — with no unit to corner-tap-test against, this port
+// deliberately does NOT attempt precise per-edge LEFT/RIGHT/UP/DOWN/POWER
+// zones (a wrong guess there is worse than no mapping: a silently-inverted
+// axis). Instead, per this port's explicit scoping call (see
+// docs/board-notes/papers3.md), only the three actions every screen in this
+// app already depends on are mapped, using zones generous enough to survive
+// being wrong about exact axis orientation:
+//
+//   +----------------------------------------------------------+
+//   |                                                            |
+//   |                                                            |
+//   |                  CONFIRM  (tap anywhere here)              |
+//   |             hold ~500ms anywhere on screen = MENU          |
+//   |                                                            |
+//   |                                                            |
+//   +----------+                                                 |
+//   |   BACK   |                                                 |
+//   | (tap)    |                                                 |
+//   +----------+-------------------------------------------------+
+//     0 <= nx < 0.20, 0.80 <= ny <= 1.0 (bottom-left 20% x 20%)
+//
+// BACK is a corner because a corner is the one zone whose identity survives
+// a still-unverified axis swap/flip getting corrected later (BoardConfig.h
+// :1248-1253) — it stays "some corner" even if which corner moves; the
+// board note documents re-verifying this against real hardware. LEFT/RIGHT/
+// UP/DOWN/POWER are explicitly NOT mapped — see docs/board-notes/papers3.md
+// "Deferred".
+//
+// NOTE for the FreeInkApp-migration branch: that migration's own research
+// found FreeInkUIInputManager.h's snapshotFrom() adapter already turns touch
+// into FreeInkApp's InputSnapshot/on() handler model on boards that support
+// it. If/when that migration lands, this hand-rolled zone dispatch should
+// fold into that InputSnapshot mapping instead — kept isolated in this one
+// block specifically so that reconciliation is a find-and-delete against a
+// clearly-marked region, not a hunt through handleInput(). See
+// docs/board-notes/papers3.md "FreeInkApp-migration overlap".
+static bool touchOnlyNavActive() {
+  const auto& t = BoardConfig::ACTIVE.touch;
+  const auto& in = BoardConfig::ACTIVE.input;
+  // Checking input.confirm alone is NOT enough: BoardConfig::PAPER_MONO also
+  // has touch.controller=Ft5x06, touch.synthesizeConfirm=false,
+  // touch.hasHomeKey=false, AND input.confirm==PIN_UNASSIGNED (its
+  // CONFIRM/BACK come from a real up/down GPIO combo decoded by
+  // InputManager::updateDigitalTwoButton(), not from input.confirm) — every
+  // one of those conditions alone would false-positive on PaperMono despite
+  // it having two working physical buttons. Require EVERY InputPins field to
+  // be unassigned so this only matches boards with literally no GPIO button
+  // at all, which is what "touch is the only input" actually means.
+  return t.controller != BoardConfig::TouchController::None && !t.synthesizeConfirm && !t.hasHomeKey &&
+         in.back == BoardConfig::PIN_UNASSIGNED && in.confirm == BoardConfig::PIN_UNASSIGNED &&
+         in.left == BoardConfig::PIN_UNASSIGNED && in.right == BoardConfig::PIN_UNASSIGNED &&
+         in.up == BoardConfig::PIN_UNASSIGNED && in.down == BoardConfig::PIN_UNASSIGNED &&
+         in.power == BoardConfig::PIN_UNASSIGNED;
+}
+
+static constexpr float TOUCH_BACK_ZONE_NX = 0.20f;  // BACK: nx < this
+static constexpr float TOUCH_BACK_ZONE_NY = 0.20f;  // BACK: ny > (1 - this), i.e. bottom 20%
+
+static void handleTouchNav(uint32_t now) {
+  float nx, ny;
+
+  // MENU: press-and-hold anywhere, told apart from a tap purely by dwell
+  // time — the touch equivalent of pollHold(confirmHold, ...) below, reusing
+  // InputManager's own long-press classifier (TOUCH_LONG_PRESS_MS = 500ms,
+  // freeink-sdk/libs/hardware/InputManager/include/InputManager.h:425)
+  // instead of re-implementing hold timing against isTouchPressed(). Read
+  // directly rather than via a pop queue — there isn't one for long-press.
+  // wasTouchLongPress() is a one-shot flag the async task (input.beginAsync())
+  // clears again on its own ~15ms cadence, same as wasHomeKeyTapped()/
+  // wasHomeKeyLongPressed() below for X4 Pro: a hold that starts and fully
+  // resolves while the main loop is blocked inside a full e-paper refresh
+  // (up to ~2s) can be missed entirely, with no queued fallback the way taps
+  // have via popTouchTap(). This is a pre-existing gap in InputManager's
+  // one-shot-flag pattern, not something this port introduces — but
+  // wasHomeKeyLongPressed() is never actually called anywhere in this file
+  // today, so PaperS3's MENU gesture is the first path that actually
+  // exercises it in practice, not just a theoretical parallel. See the board
+  // note's "Deferred" section for the tradeoff (queueing long-press events
+  // would mean widening InputManager's shared async-task queue, out of scope
+  // for this board-only change).
+  if (input.wasTouchLongPress(nx, ny)) {
+    // The eventual finger-lift must not ALSO register as a tap (dispatching
+    // both MENU-open and a CONFIRM/BACK on one physical press) — per
+    // wasTouchLongPress()'s own doc comment, suppressTouchContact() is how a
+    // caller opts out of that.
+    input.suppressTouchContact();
+    dispatchConfirmHold();
+    return;
+  }
+
+  // CONFIRM/BACK: drained from the async tap queue (popTouchTap), not
+  // wasTouchTap() directly — the queue exists precisely so a tap that
+  // completes while the main loop is blocked inside display.displayBuffer()
+  // (see handleInput()'s doc comment below) is never lost, the same
+  // rationale popPress() gives every button board.
+  while (input.popTouchTap(nx, ny)) {
+    if (nx < TOUCH_BACK_ZONE_NX && ny > 1.0f - TOUCH_BACK_ZONE_NY) {
+      dispatchBack(now);
+    } else {
+      dispatchConfirmTap(now);
+    }
+  }
+}
+// PaperS3 touch-only navigation — SELF-CONTAINED BLOCK, end.
+// =============================================================================
+
 // InputManager runs on a background FreeRTOS task (input.beginAsync() in
 // setup()), not on our own polling here — required because
 // display.displayWindow()/displayBuffer() block the main loop for
@@ -1197,6 +1364,17 @@ static void handleInput(uint32_t now) {
     uint8_t btn;
     bool anyPress = input.wasHomeKeyPressed();
     while (input.popPress(btn)) anyPress = true;
+    // PaperS3: mirror "any press wakes" with "any touch wakes" — see the
+    // touch-only nav block above. Also drain any tap that landed while
+    // asleep so it can't replay as an instant CONFIRM/BACK the moment the
+    // screen wakes (same "wake, don't also act" rule the comment above
+    // documents for every other board's buttons).
+    if (touchOnlyNavActive()) {
+      if (input.wasTouchActivity()) anyPress = true;
+      float dnx, dny;
+      while (input.popTouchTap(dnx, dny)) {
+      }
+    }
     if (anyPress) wakeScreen(now);
     confirmHold = HoldButton{};
     upHold = HoldButton{};
@@ -1214,6 +1392,17 @@ static void handleInput(uint32_t now) {
     if (checkShake() && (int32_t)(now - oneShotUntil) >= 0) {
       triggerOneShot(P_DIZZY, 2000);
     }
+  }
+
+  // PaperS3: no buttons and no Home key exist to fall through to below (the
+  // popPress()/isPressed() calls past this point are harmless no-ops on this
+  // board — GT911 only ever sets BTN_CONFIRM when synthesizeConfirm is true,
+  // which PaperS3's profile leaves false — but returning here keeps this
+  // board's actual dispatch path in the one clearly-marked block above it).
+  // See "PaperS3 touch-only navigation" above for the full zone layout.
+  if (touchOnlyNavActive()) {
+    handleTouchNav(now);
+    return;
   }
 
   // BACK/LEFT/RIGHT/POWER: plain press-edge actions, no hold behavior.
@@ -1305,8 +1494,15 @@ void setup() {
   // consumer app (inkdeck, src/main.cpp setup()) uses for this same board.
   // X4 Pro doesn't need this: its SD card is native SDMMC on entirely
   // separate pins (CLK41/CMD42/DAT40), not a shared SPI bus — see
-  // freeink-sdk/docs/xteink-x4pro-support.md "Storage".
-  if (!BoardConfig::isX4Pro()) {
+  // freeink-sdk/docs/xteink-x4pro-support.md "Storage". Neither does PaperS3:
+  // its display isn't SPI at all (LgfxEpd drives the ED047TC1 over an 8-bit
+  // parallel bus — BoardConfig::M5PAPER_S3.display.sclk/mosi/cs are all
+  // PIN_UNASSIGNED, BoardConfig.h:1261-1262), so there is no display bus to
+  // share; its SD card is its own dedicated SPI pins (SCLK39/MISO40/MOSI38/
+  // CS47, BoardConfig.h:1264). Calling SPI.begin() with PIN_UNASSIGNED
+  // display pins here would be wrong for this board — SDCardManager brings
+  // its own SD bus up instead.
+  if (!BoardConfig::isX4Pro() && !BoardConfig::isM5PaperS3()) {
     SPI.begin(BoardConfig::ACTIVE.display.sclk, BoardConfig::ACTIVE.sd.miso, BoardConfig::ACTIVE.display.mosi,
               BoardConfig::ACTIVE.display.cs);
   }
