@@ -361,6 +361,28 @@ static void clockRefreshRtc() {
   M5.Rtc.GetDate(&_clkDt);
 }
 
+// data.h platform hook (see its declaration): write the bridge's time sync
+// to the AXP-backed RTC chip and force clockRefreshRtc() to re-read so
+// _clkDt/_rtcValid agree on the next tick.
+void platformTimeSync(const struct tm& lt) {
+  RTC_TimeTypeDef tm = { (uint8_t)lt.tm_hour, (uint8_t)lt.tm_min, (uint8_t)lt.tm_sec };
+  RTC_DateTypeDef dt = { (uint8_t)lt.tm_wday, (uint8_t)(lt.tm_mon + 1),
+                         (uint8_t)lt.tm_mday, (uint16_t)(lt.tm_year + 1900) };
+  M5.Rtc.SetTime(&tm);
+  M5.Rtc.SetDate(&dt);
+  _clkLastRead = 0;
+}
+
+// xfer.h platform hook (see its declaration): AXP192 PMIC battery telemetry.
+PlatformBatteryStatus platformBatteryStatus() {
+  int vBat = (int)(M5.Axp.GetBatVoltage() * 1000);
+  int iBat = (int)M5.Axp.GetBatCurrent();
+  int vBus = (int)(M5.Axp.GetVBusVoltage() * 1000);
+  int pct = (vBat - 3200) / 10;
+  if (pct < 0) pct = 0; if (pct > 100) pct = 100;
+  return { pct, vBat, iBat, vBus > 4000 };
+}
+
 static void clockUpdateOrient() {
   float ax, ay, az;
   M5.Imu.getAccelData(&ax, &ay, &az);

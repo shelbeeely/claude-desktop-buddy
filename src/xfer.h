@@ -5,11 +5,27 @@
 #include <mbedtls/base64.h>
 #include <ArduinoJson.h>
 
+// Runtime character-pack push (BLE folder drop -> LittleFS -> AnimatedGIF
+// decode) is an M5StickCPlus-era feature: it assumes a color TFT, an
+// on-device GIF decoder (character.cpp), and spare LittleFS space for a
+// second copy of the pack. The Xteink X4 port ships its character art as
+// compiled-in freeink::Icon structs generated offline (see
+// tools/gif_to_icons.py) instead — no on-device decode, no flicker-prone
+// runtime asset install on e-ink. Default on for the original M5 target;
+// the xteink_x4 env sets this to 0 (see platformio.ini), which makes
+// char_begin decline per REFERENCE.md ("If your device doesn't want
+// pushed files, don't ack char_begin. The desktop times out ...").
+#ifndef BUDDY_SUPPORTS_CHAR_PUSH
+#define BUDDY_SUPPORTS_CHAR_PUSH 1
+#endif
+
+#if BUDDY_SUPPORTS_CHAR_PUSH
 static File     _xFile;
 static uint32_t _xExpected = 0, _xWritten = 0;
 static char     _xCharName[24] = "";
 static bool     _xActive = false;
 static uint32_t _xTotal = 0, _xTotalWritten = 0;
+#endif
 
 // Ack goes to both streams — we don't track which one delivered the command,
 // and writes to a clientless SerialBT just drop. The bridge listens on
@@ -21,6 +37,7 @@ static void _xAck(const char* what, bool ok, uint32_t n = 0) {
   bleWrite((const uint8_t*)b, len);
 }
 
+#if BUDDY_SUPPORTS_CHAR_PUSH
 static uint32_t _xWipeDir(const char* dir) {
   File d = LittleFS.open(dir);
   if (!d || !d.isDirectory()) { LittleFS.mkdir(dir); return 0; }
@@ -61,6 +78,7 @@ static uint32_t _xWipeAllChars() {
   root.close();
   return freed;
 }
+#endif  // BUDDY_SUPPORTS_CHAR_PUSH
 
 // Called from data.h when incoming JSON has a "cmd" key. Returns true if
 // it was a transfer command (caller should skip state-update parsing).
@@ -72,7 +90,22 @@ const char* petName();
 void ownerSet(const char* name);
 const char* ownerName();
 #include "stats.h"
-#include <M5StickCPlus.h>
+
+// Platform hook: battery/power telemetry for the "status" ack below.
+// M5StickCPlus reads it off the AXP192 PMIC; a board with a plain ADC
+// divider (e.g. Xteink X4 — no PMIC, no charge-status pin, see
+// BoardConfig::XTEINK_X4) reads BatteryMonitor instead and always
+// reports usb=false (X4 has no charge-status GPIO to sense it — see
+// README "Divergences from the original buddy"). Declared here (not
+// defined) so xfer.h stays board-agnostic; exactly one platform main.cpp
+// must define it.
+struct PlatformBatteryStatus {
+  int pct;   // 0-100
+  int mV;    // battery millivolts
+  int mA;    // battery current, negative = charging (0 if unknown)
+  bool usb;  // external power present
+};
+PlatformBatteryStatus platformBatteryStatus();
 
 inline bool xferCommand(JsonDocument& doc) {
   const char* cmd = doc["cmd"];
@@ -112,11 +145,7 @@ inline bool xferCommand(JsonDocument& doc) {
   if (strcmp(cmd, "status") == 0) {
     // Dump everything the info screens show. Manual printf rather than
     // ArduinoJson serialize — less heap churn, and the shape is fixed.
-    int vBat = (int)(M5.Axp.GetBatVoltage() * 1000);
-    int iBat = (int)M5.Axp.GetBatCurrent();
-    int vBus = (int)(M5.Axp.GetVBusVoltage() * 1000);
-    int pct = (vBat - 3200) / 10;
-    if (pct < 0) pct = 0; if (pct > 100) pct = 100;
+    PlatformBatteryStatus bat = platformBatteryStatus();
     char b[320];
     int len = snprintf(b, sizeof(b),
       "{\"ack\":\"status\",\"ok\":true,\"n\":0,\"data\":{"
@@ -126,10 +155,14 @@ inline bool xferCommand(JsonDocument& doc) {
       "\"stats\":{\"appr\":%u,\"deny\":%u,\"vel\":%u,\"nap\":%lu,\"lvl\":%u}"
       "}}\n",
       petName(), ownerName(), bleSecure() ? "true" : "false",
-      pct, vBat, iBat, (vBus > 4000) ? "true" : "false",
+      bat.pct, bat.mV, bat.mA, bat.usb ? "true" : "false",
       millis() / 1000, ESP.getFreeHeap(),
+#if BUDDY_SUPPORTS_CHAR_PUSH
       (unsigned long)(LittleFS.totalBytes() - LittleFS.usedBytes()),
       (unsigned long)LittleFS.totalBytes(),
+#else
+      0ul, 0ul,  // no LittleFS character store on this board — see BUDDY_SUPPORTS_CHAR_PUSH
+#endif
       stats().approvals, stats().denials, statsMedianVelocity(),
       (unsigned long)stats().napSeconds, stats().level
     );
@@ -139,6 +172,12 @@ inline bool xferCommand(JsonDocument& doc) {
   }
 
   if (strcmp(cmd, "char_begin") == 0) {
+#if !BUDDY_SUPPORTS_CHAR_PUSH
+    // Decline silently (no ack): the desktop times out and reports the
+    // push failed, exactly as REFERENCE.md documents for devices that
+    // don't want pushed files. This board's character art is baked in.
+    return true;
+#else
     const char* name = doc["name"] | "pet";
     _xTotal = doc["total"] | 0;
 
@@ -183,8 +222,10 @@ inline bool xferCommand(JsonDocument& doc) {
     _xActive = true;
     _xAck("char_begin", true);
     return true;
+#endif  // BUDDY_SUPPORTS_CHAR_PUSH
   }
 
+#if BUDDY_SUPPORTS_CHAR_PUSH
   if (!_xActive) return strcmp(cmd, "permission") != 0;  // permission cmd is not ours
 
   if (strcmp(cmd, "file") == 0) {
@@ -230,10 +271,17 @@ inline bool xferCommand(JsonDocument& doc) {
     _xAck("char_end", ok);
     return true;
   }
+#endif  // BUDDY_SUPPORTS_CHAR_PUSH
 
   return false;
 }
 
+#if BUDDY_SUPPORTS_CHAR_PUSH
 inline bool xferActive() { return _xActive; }
 inline uint32_t xferProgress() { return _xTotalWritten; }
 inline uint32_t xferTotal() { return _xTotal; }
+#else
+inline bool xferActive() { return false; }
+inline uint32_t xferProgress() { return 0; }
+inline uint32_t xferTotal() { return 0; }
+#endif

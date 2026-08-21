@@ -63,9 +63,19 @@ inline const char* dataScenarioName() {
 }
 
 // Set true once the bridge sends a time sync — until then the RTC may
-// hold whatever was on the coin cell (or 2000-01-01 if it lost power).
+// hold whatever was on the coin cell (or 2000-01-01 if it lost power),
+// or on a board with no RTC at all, whatever platformTimeSync() faked up.
 static bool _rtcValid = false;
 inline bool dataRtcValid() { return _rtcValid; }
+
+// Platform hook: hand the decoded local time to whatever the board has —
+// M5StickCPlus writes it to the AXP-backed RTC chip and resets its 1Hz
+// clock-face cache; a board with no RTC (e.g. Xteink X4 — see
+// BoardConfig::XTEINK_X4, no CAP_RTC) just latches millis()-relative
+// wall-clock state in RAM, which does not survive a reboot or deep sleep.
+// Declared here (not defined) so data.h stays board-agnostic; exactly one
+// platform main.cpp must define it.
+void platformTimeSync(const struct tm& localTime);
 
 static void _applyJson(const char* line, TamaState* out) {
   JsonDocument doc;
@@ -78,13 +88,7 @@ static void _applyJson(const char* line, TamaState* out) {
   if (!t.isNull() && t.size() == 2) {
     time_t local = (time_t)t[0].as<uint32_t>() + (int32_t)t[1];
     struct tm lt; gmtime_r(&local, &lt);
-    RTC_TimeTypeDef tm = { (uint8_t)lt.tm_hour, (uint8_t)lt.tm_min, (uint8_t)lt.tm_sec };
-    RTC_DateTypeDef dt = { (uint8_t)lt.tm_wday, (uint8_t)(lt.tm_mon + 1),
-                           (uint8_t)lt.tm_mday, (uint16_t)(lt.tm_year + 1900) };
-    M5.Rtc.SetTime(&tm);
-    M5.Rtc.SetDate(&dt);
-    extern uint32_t _clkLastRead;
-    _clkLastRead = 0;   // force re-read so _clkDt and _rtcValid agree
+    platformTimeSync(lt);
     _rtcValid = true;
     _lastLiveMs = millis();
     return;

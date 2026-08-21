@@ -63,7 +63,12 @@ inline void statsSave() {
 // Level is token-driven now; approvals only feed mood/velocity.
 inline void statsOnApproval(uint32_t secondsToRespond) {
   _stats.approvals++;
-  _stats.velocity[_stats.velIdx] = (uint16_t)min(secondsToRespond, 65535u);
+  // Not std::min(secondsToRespond, 65535u): uint32_t is `long unsigned int`
+  // on this toolchain, distinct from the unsigned-int literal's type, which
+  // makes template argument deduction ambiguous — a real portability gap
+  // the X4 build's newer toolchain surfaced (the M5 build's older one
+  // happened to resolve uint32_t and unsigned int to the same type).
+  _stats.velocity[_stats.velIdx] = (uint16_t)(secondsToRespond > 65535u ? 65535u : secondsToRespond);
   _stats.velIdx = (_stats.velIdx + 1) % 8;
   if (_stats.velCount < 8) _stats.velCount++;
   _dirty = true; statsSave();
