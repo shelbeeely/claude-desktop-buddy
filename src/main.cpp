@@ -53,6 +53,20 @@
 #include <BoardPaperS3.h>
 #endif
 
+// LilyGo T5 S3 only: BoardT5S3 owns the shared I2C bus, the PCA9535 IO
+// expander (EPD power sequencing + the user-button hook), and SD/LoRa/GPS
+// pin prep. It is not linked into the other envs (env:xteink,
+// env:xteink_x4pro have no BoardT5S3 in lib_deps), so this header can only be
+// guarded at compile time, not with a BoardConfig::ACTIVE runtime check like
+// the rest of this file uses — same reason freeink-sdk's own LgfxEpdDriver.cpp
+// gates <M5GFX.h> behind FREEINK_DRIVER_LGFX_EPD. FREEINK_DEVICE_LILYGO is 0
+// (not undefined) on every other build via BoardConfig.h's own #ifndef
+// fallback, so this is inert everywhere else. See
+// docs/board-notes/lilygo-t5s3.md.
+#if FREEINK_DEVICE_LILYGO
+#include <BoardT5S3.h>
+#endif
+
 #include "ble_bridge.h"
 #include "data.h"
 #include "assets/icons_bufo.h"
@@ -1491,6 +1505,15 @@ static void handleInput(uint32_t now) {
 }
 
 void setup() {
+  // LilyGo T5 S3 only (BoardConfig::LILYGO_T5S3.power.latch0 = GPIO2; every
+  // other board's power.latch0/1 default to PIN_UNASSIGNED, which this
+  // no-ops on): a battery-latched board must drive its hold pin HIGH before
+  // anything else or it powers off the instant USB is unplugged — same
+  // requirement as the Sticky/M5Paper v1.1 units (see
+  // freeink-sdk/libs/hardware/BoardConfig/include/BoardConfig.h
+  // holdPowerRails()). Safe and inert to call unconditionally on every board.
+  BoardConfig::holdPowerRails();
+
   Serial.begin(115200);
   statsLoad();
   settingsLoad();
@@ -1537,18 +1560,33 @@ void setup() {
   // Murphy M3 and correctly extends to it: Murphy's SD is plain SPI
   // (sdmmc.busWidth == 0, see docs/board-notes/murphy-m3.md), so it stays
   // on this pre-claim path like X3/X4, not the X4 Pro native-SDMMC path.
-  // PaperS3 also reports sdmmc.busWidth == 0 (its SD is plain SPI too) but
-  // its display isn't SPI at all — LgfxEpd drives the ED047TC1 over an
-  // 8-bit parallel bus, so BoardConfig::M5PAPER_S3.display.sclk/mosi/cs are
-  // all PIN_UNASSIGNED (BoardConfig.h:1261-1262) and there is no display
-  // bus to pre-claim; its SD card is its own dedicated SPI pins (SCLK39/
-  // MISO40/MOSI38/CS47, BoardConfig.h:1264), brought up by SDCardManager on
-  // its own. Gating on display.sclk being assigned (not PIN_UNASSIGNED)
-  // excludes PaperS3 correctly alongside the busWidth check.
+  // PaperS3 and LilyGo T5 S3 also report sdmmc.busWidth == 0 (plain-SPI SD
+  // on both) but neither display is SPI at all — both drive their glass
+  // over the S3 parallel/i80 bus via LgfxEpd, so
+  // BoardConfig::M5PAPER_S3/LILYGO_T5S3.display.sclk/mosi/cs are all
+  // PIN_UNASSIGNED (BoardConfig.h:1261-1262 and LilyGo's own profile) and
+  // there is no display bus to pre-claim; each board's SD card is its own
+  // dedicated SPI pins, brought up by SDCardManager (PaperS3) or
+  // BoardT5S3::begin() (LilyGo) on their own. Gating on display.sclk being
+  // assigned (not PIN_UNASSIGNED) excludes both boards correctly alongside
+  // the busWidth check, without needing a per-board name comparison.
   if (BoardConfig::ACTIVE.sdmmc.busWidth == 0 && BoardConfig::ACTIVE.display.sclk != BoardConfig::PIN_UNASSIGNED) {
     SPI.begin(BoardConfig::ACTIVE.display.sclk, BoardConfig::ACTIVE.sd.miso, BoardConfig::ACTIVE.display.mosi,
               BoardConfig::ACTIVE.display.cs);
   }
+
+  // LilyGo T5 S3 only: bring up the shared I2C bus (touch/RTC/gauge/PCA9535
+  // all share it — see BoardT5S3Pins.h SDA39/SCL40), configure the PCA9535
+  // expander pins the EPD power sequence needs, register the expander
+  // user-button hook (InputManager::setButtonHook -> BTN_DOWN; see
+  // docs/board-notes/lilygo-t5s3.md "Input coverage"), disable the unused
+  // LoRa/GPS pins, and prep the SD SPI bus. MUST run before display.begin():
+  // the LgfxEpdConfig power hooks (prepareEpdPower/epdPowerOn in
+  // freeink-sdk/libs/hardware/BoardT5S3/src/LilyGoT5S3LgfxConfig.cpp) talk to
+  // the PCA9535/TPS65185 over Wire, which isn't up until this runs.
+#if FREEINK_DEVICE_LILYGO
+  BoardT5S3::begin();
+#endif
 
   display.begin();
   PANEL_TOTAL_W = display.getDisplayWidth();
