@@ -65,9 +65,7 @@ inline void statsOnApproval(uint32_t secondsToRespond) {
   _stats.approvals++;
   // Not std::min(secondsToRespond, 65535u): uint32_t is `long unsigned int`
   // on this toolchain, distinct from the unsigned-int literal's type, which
-  // makes template argument deduction ambiguous — a real portability gap
-  // the X4 build's newer toolchain surfaced (the M5 build's older one
-  // happened to resolve uint32_t and unsigned int to the same type).
+  // makes template argument deduction ambiguous.
   _stats.velocity[_stats.velIdx] = (uint16_t)(secondsToRespond > 65535u ? 65535u : secondsToRespond);
   _stats.velIdx = (_stats.velIdx + 1) % 8;
   if (_stats.velCount < 8) _stats.velCount++;
@@ -179,42 +177,6 @@ inline uint8_t statsFedProgress() {
   return (uint8_t)((_stats.tokens % TOKENS_PER_LEVEL) / (TOKENS_PER_LEVEL / 10));
 }
 
-// --- Settings --------------------------------------------------------------
-
-struct Settings {
-  bool sound;
-  bool bt;
-  bool wifi;     // placeholder — no WiFi stack linked yet, just stores the pref
-  bool led;
-  bool hud;
-  uint8_t clockRot;  // 0=auto 1=portrait 2=landscape
-};
-
-static Settings _settings = { true, true, false, true, true, 0 };
-
-inline void settingsLoad() {
-  _prefs.begin("buddy", true);
-  _settings.sound = _prefs.getBool("s_snd", true);
-  _settings.bt    = _prefs.getBool("s_bt",  true);
-  _settings.wifi  = _prefs.getBool("s_wifi",false);
-  _settings.led   = _prefs.getBool("s_led", true);
-  _settings.hud      = _prefs.getBool("s_hud", true);
-  _settings.clockRot = _prefs.getUChar("s_crot", 0);
-  if (_settings.clockRot > 2) _settings.clockRot = 0;
-  _prefs.end();
-}
-
-inline void settingsSave() {
-  _prefs.begin("buddy", false);
-  _prefs.putBool("s_snd", _settings.sound);
-  _prefs.putBool("s_bt",  _settings.bt);
-  _prefs.putBool("s_wifi",_settings.wifi);
-  _prefs.putBool("s_led", _settings.led);
-  _prefs.putBool("s_hud", _settings.hud);
-  _prefs.putUChar("s_crot", _settings.clockRot);
-  _prefs.end();
-}
-
 static char _petName[24] = "Buddy";
 static char _ownerName[32] = "";
 
@@ -254,20 +216,5 @@ inline void ownerSet(const char* name) {
 }
 
 inline const char* ownerName() { return _ownerName; }
-
-inline uint8_t speciesIdxLoad() {
-  _prefs.begin("buddy", true);
-  uint8_t v = _prefs.getUChar("species", 0xFF);
-  _prefs.end();
-  return v;
-}
-
-inline void speciesIdxSave(uint8_t idx) {
-  _prefs.begin("buddy", false);
-  _prefs.putUChar("species", idx);
-  _prefs.end();
-}
-
-inline Settings& settings() { return _settings; }
 
 inline const Stats& stats() { return _stats; }

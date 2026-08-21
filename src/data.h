@@ -62,19 +62,16 @@ inline const char* dataScenarioName() {
   return "none";
 }
 
-// Set true once the bridge sends a time sync — until then the RTC may
-// hold whatever was on the coin cell (or 2000-01-01 if it lost power),
-// or on a board with no RTC at all, whatever platformTimeSync() faked up.
+// Set true once the bridge sends a time sync.
 static bool _rtcValid = false;
 inline bool dataRtcValid() { return _rtcValid; }
 
-// Platform hook: hand the decoded local time to whatever the board has —
-// M5StickCPlus writes it to the AXP-backed RTC chip and resets its 1Hz
-// clock-face cache; a board with no RTC (e.g. Xteink X4 — see
-// BoardConfig::XTEINK_X4, no CAP_RTC) just latches millis()-relative
-// wall-clock state in RAM, which does not survive a reboot or deep sleep.
-// Declared here (not defined) so data.h stays board-agnostic; exactly one
-// platform main.cpp must define it.
+// The X4 has no RTC (BoardConfig::XTEINK_X4 has no CAP_RTC), so there's
+// nowhere to persist wall-clock time through a reboot or deep sleep —
+// main.cpp's platformTimeSync() is a no-op today. Kept as a real hook
+// (declared here, defined in main.cpp) rather than deleted outright so a
+// future consumer (e.g. a status timestamp) has somewhere to start from
+// without touching data.h again.
 void platformTimeSync(const struct tm& localTime);
 
 static void _applyJson(const char* line, TamaState* out) {

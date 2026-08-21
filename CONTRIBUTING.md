@@ -9,11 +9,11 @@ thing _you_ want than bend this one into it.
 
 ## So what should I do instead?
 
-**Fork it and make it yours.** Swap the M5Stick for a Pi Pico W. Replace
-the ASCII pets with an e-ink panel. Put it in a 3D-printed shell. Rip
-out everything but `ble_bridge.cpp` and the JSON parser. The protocol is
-the stable surface — `REFERENCE.md` is the contract, this firmware is
-just one way to honor it.
+**Fork it and make it yours.** Swap the Xteink X4 for a board you have on
+hand. Replace the e-ink rendering with a color LCD. Put it in a
+3D-printed shell. Rip out everything but `ble_bridge.cpp` and the JSON
+parser. The protocol is the stable surface — `REFERENCE.md` is the
+contract, this firmware is just one way to honor it.
 
 ## What we will take
 
