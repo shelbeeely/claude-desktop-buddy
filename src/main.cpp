@@ -1,4 +1,4 @@
-// claude-desktop-buddy — Xteink firmware (X4, X3, X4 Pro).
+// claude-desktop-buddy — Xteink firmware (X4, X3, X4 Pro, Murphy M3).
 //
 // Nordic UART Service BLE bridge (ble_bridge.cpp/h) + JSON wire protocol
 // (data.h, xfer.h) + NVS-backed stats/owner/settings (stats.h) driving a
@@ -9,18 +9,19 @@
 // settings menu cycle between them — see README.md "SD-backed character
 // packs" and "Menu system".
 //
-// This one file drives three boards, two of which (X4, X3) share one
+// This one file drives four boards, two of which (X4, X3) share one
 // ESP32-C3 binary (env:xteink) picked at runtime by freeink::
-// selectXteinkDevice() in setup(); the third (X4 Pro) is ESP32-S3 and
-// builds separately (env:xteink_x4pro) but runs the same source. Where a
-// board has real hardware the M5-era original also had (X3's IMU/RTC/
-// battery gauge, X4 Pro's touch/frontlight/RTC/gauge), this file uses it via
-// BoardConfig::hasImu()/hasRtc()/isX4Pro() and the Imu/Rtc/FrontlightManager
-// libraries; where a board has none of it (X4: BoardConfig::XTEINK_X4 is
-// NO_SENSORS/NO_AUDIO/NO_LEDS/NO_FRONTLIGHT, no RTC), the same button/
-// software substitutes from the X4-only version remain. See README.md
-// "Multi-board support" for the full capability matrix, and "Menu system"
-// for what's substituted versus real per board.
+// selectXteinkDevice() in setup(); the other two (X4 Pro, Murphy M3) are
+// ESP32-S3 and build separately (env:xteink_x4pro, env:murphy) but run the
+// same source. Where a board has real hardware the M5-era original also had
+// (X3's IMU/RTC/battery gauge, X4 Pro's touch/frontlight/RTC/gauge), this
+// file uses it via BoardConfig::hasImu()/hasRtc()/isX4Pro()/isMurphyM3()
+// and the Imu/Rtc/FrontlightManager libraries; where a board has none of it
+// (X4: BoardConfig::XTEINK_X4 is NO_SENSORS/NO_AUDIO/NO_LEDS/NO_FRONTLIGHT,
+// no RTC), the same button/software substitutes from the X4-only version
+// remain. See README.md "Multi-board support" for the full capability
+// matrix, and "Menu system" for what's substituted versus real per board;
+// see docs/board-notes/murphy-m3.md for Murphy M3's port-specific findings.
 //
 // See README.md for the sprite-region size, the full-refresh timer
 // interval, and the full input mapping.
@@ -271,7 +272,18 @@ static uint32_t lastFullRefreshMs = 0;
 static void invertSpriteRegionBytes() {
   uint8_t* fb = display.getFrameBuffer();
   uint16_t wb = display.getDisplayWidthBytes();
-  for (int16_t y = SPRITE_Y; y < SPRITE_Y + SPRITE_H; y++) {
+  // SPRITE_Y+SPRITE_H (300) is a fixed constant sized for the >=300px-tall
+  // panels this sprite box was designed for (X3/X4/X4 Pro/de-link/Sticky/
+  // Paper Mono). Murphy M3's panel reports only 240px tall (see
+  // freeink-sdk/libs/hardware/BoardConfig/include/BoardConfig.h:988 —
+  // MURPHY_M3's framebuffer height), so the unclamped loop wrote 60 rows past
+  // the end of the runtime-allocated framebuffer on every `attention` flash
+  // cue. Clamp to the real panel height (PANEL_TOTAL_H, set in setup() from
+  // display.getDisplayHeight()) — a no-op everywhere the panel is already
+  // tall enough.
+  int16_t yEnd = SPRITE_Y + SPRITE_H;
+  if (yEnd > PANEL_TOTAL_H) yEnd = PANEL_TOTAL_H;
+  for (int16_t y = SPRITE_Y; y < yEnd; y++) {
     for (int16_t xb = SPRITE_X / 8; xb < (SPRITE_X + SPRITE_W) / 8; xb++) {
       fb[(uint32_t)y * wb + xb] ^= 0xFF;
     }
@@ -773,7 +785,9 @@ static void drawInfoPage(uint32_t now, int16_t y) {
     y += 8;
     ln(Color::DarkGray, "hardware");
     ln(Color::Black, BoardConfig::ACTIVE.name);
-    ln(Color::Black, BoardConfig::isX4Pro() ? "ESP32-S3" : "ESP32-C3");
+    // X4 Pro and Murphy M3 are both ESP32-S3 builds; X3/X4 are ESP32-C3 (see
+    // the file header comment for the board-to-MCU-family mapping).
+    ln(Color::Black, (BoardConfig::isX4Pro() || BoardConfig::isMurphyM3()) ? "ESP32-S3" : "ESP32-C3");
   }
 }
 
@@ -1246,6 +1260,20 @@ static void handleInput(uint32_t now) {
       if (transcriptOffset < maxOffset) transcriptOffset++;
       needsRedraw = true;
     } else if (btn == InputManager::BTN_POWER) {
+      // InputStyle::DigitalFiveKey (Murphy M3) has no tap/hold disambiguation
+      // for a shared confirm/power pin the way DigitalConfirmPowerHold (e.g.
+      // Sticky) does — freeink-sdk's InputManager sets BTN_CONFIRM and
+      // BTN_POWER together on every press of that one key (InputManager.cpp
+      // getDigitalState(), ~line 271-283), so without this guard every press
+      // would sleep the screen here before the CONFIRM poll below ever runs,
+      // leaving CONFIRM permanently unreachable on that hardware (see
+      // docs/board-notes/murphy-m3.md "Input"). Boards with real
+      // hold-vs-tap logic for a shared pin (Sticky) only ever emit BTN_POWER
+      // for a genuine hold, so this only skips the spurious case.
+      if (BoardConfig::ACTIVE.inputStyle == BoardConfig::InputStyle::DigitalFiveKey &&
+          BoardConfig::ACTIVE.input.power == BoardConfig::ACTIVE.input.confirm) {
+        continue;
+      }
       sleepScreen(now);
       return;  // screen is asleep now; the rest of this batch no longer applies
     }
@@ -1292,21 +1320,32 @@ void setup() {
   bool isX3 = freeink::selectXteinkDevice();
   if (isX3) display.setDisplayX3();
 
-  // X3/X4 share the display's SPI bus with the SD card slot (BoardConfig::
-  // XTEINK_X4.sd: sclk/mosi unassigned, separateSpi=false — miso(7) and
-  // cs(12) are the only pins unique to the card). FreeInkDisplay::begin()
-  // only wires MISO into the bus when the active panel driver needs it
-  // (PanelDriver::spiMiso() defaults to -1 for SSD1677/X4 — the display
-  // itself is write-only); left alone, the bus would come up with no MISO
-  // pin and SD reads would never work afterward, since a second SPI.begin()
-  // with different pins is unreliable once the bus is already initialized.
-  // Claiming it once here, with the SD MISO included, before display.begin()
-  // runs its own SPI.begin(), is exactly the sequence Free-Ink's own X4
-  // consumer app (inkdeck, src/main.cpp setup()) uses for this same board.
-  // X4 Pro doesn't need this: its SD card is native SDMMC on entirely
-  // separate pins (CLK41/CMD42/DAT40), not a shared SPI bus — see
-  // freeink-sdk/docs/xteink-x4pro-support.md "Storage".
-  if (!BoardConfig::isX4Pro()) {
+  // X3/X4 (and any other board with sdmmc.busWidth == 0) share the display's
+  // SPI bus with the SD card slot (BoardConfig::XTEINK_X4.sd: sclk/mosi
+  // unassigned, separateSpi=false — miso(7) and cs(12) are the only pins
+  // unique to the card). FreeInkDisplay::begin() only wires MISO into the
+  // bus when the active panel driver needs it (PanelDriver::spiMiso()
+  // defaults to -1 for SSD1677/X4 — the display itself is write-only); left
+  // alone, the bus would come up with no MISO pin and SD reads would never
+  // work afterward, since a second SPI.begin() with different pins is
+  // unreliable once the bus is already initialized. Claiming it once here,
+  // with the SD MISO included, before display.begin() runs its own
+  // SPI.begin(), is exactly the sequence Free-Ink's own X4 consumer app
+  // (inkdeck, src/main.cpp setup()) uses for this same board.
+  //
+  // The real condition is "does this board share one SPI bus between
+  // display and SD card", not "is this board X4 Pro" — boards with native
+  // SDMMC (X4 Pro's CLK41/CMD42/DAT40, see
+  // freeink-sdk/docs/xteink-x4pro-support.md "Storage") don't need this
+  // pre-claim at all, and a board-name check would silently do the wrong
+  // (harmless-looking but pointless) thing for every future SPI-SD board.
+  // ACTIVE.sdmmc.busWidth == 0 is the same native-SDMMC test
+  // SDCardManager itself uses (BoardConfig.h ~1656-1657), so this is
+  // equivalent to the old !isX4Pro() check on every board that predates
+  // Murphy M3 and correctly extends to it: Murphy's SD is plain SPI
+  // (sdmmc.busWidth == 0, see docs/board-notes/murphy-m3.md), so it stays
+  // on this pre-claim path like X3/X4, not the X4 Pro native-SDMMC path.
+  if (BoardConfig::ACTIVE.sdmmc.busWidth == 0) {
     SPI.begin(BoardConfig::ACTIVE.display.sclk, BoardConfig::ACTIVE.sd.miso, BoardConfig::ACTIVE.display.mosi,
               BoardConfig::ACTIVE.display.cs);
   }
