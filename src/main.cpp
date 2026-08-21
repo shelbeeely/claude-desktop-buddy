@@ -1,4 +1,4 @@
-// claude-desktop-buddy — Xteink firmware (X4, X3, X4 Pro).
+// claude-desktop-buddy — Xteink firmware (X4, X3, X4 Pro, M5 PaperColor).
 //
 // Nordic UART Service BLE bridge (ble_bridge.cpp/h) + JSON wire protocol
 // (data.h, xfer.h) + NVS-backed stats/owner/settings (stats.h) driving a
@@ -9,18 +9,22 @@
 // settings menu cycle between them — see README.md "SD-backed character
 // packs" and "Menu system".
 //
-// This one file drives three boards, two of which (X4, X3) share one
+// This one file drives four boards. Two of them (X4, X3) share one
 // ESP32-C3 binary (env:xteink) picked at runtime by freeink::
-// selectXteinkDevice() in setup(); the third (X4 Pro) is ESP32-S3 and
-// builds separately (env:xteink_x4pro) but runs the same source. Where a
+// selectXteinkDevice() in setup(); the other two (X4 Pro, M5 PaperColor) are
+// each ESP32-S3 but build separately (env:xteink_x4pro, env:papercolor —
+// different boards, not a shared binary) and run the same source. Where a
 // board has real hardware the M5-era original also had (X3's IMU/RTC/
 // battery gauge, X4 Pro's touch/frontlight/RTC/gauge), this file uses it via
 // BoardConfig::hasImu()/hasRtc()/isX4Pro() and the Imu/Rtc/FrontlightManager
 // libraries; where a board has none of it (X4: BoardConfig::XTEINK_X4 is
-// NO_SENSORS/NO_AUDIO/NO_LEDS/NO_FRONTLIGHT, no RTC), the same button/
-// software substitutes from the X4-only version remain. See README.md
-// "Multi-board support" for the full capability matrix, and "Menu system"
-// for what's substituted versus real per board.
+// NO_SENSORS/NO_AUDIO/NO_LEDS/NO_FRONTLIGHT, no RTC; M5 PaperColor similarly
+// lacks touch/frontlight/RTC/gauge — see docs/board-notes/papercolor.md), the
+// same button/software substitutes from the X4-only version remain. See
+// README.md "Multi-board support" for the X4/X3/X4-Pro capability matrix and
+// "Menu system" for what's substituted versus real per board; PaperColor's
+// own board note (docs/board-notes/papercolor.md) covers its input-style
+// gaps and the DC-balance/layout specifics called out below.
 //
 // See README.md for the sprite-region size, the full-refresh timer
 // interval, and the full input mapping.
@@ -218,16 +222,21 @@ static void triggerOneShot(PersonaState s, uint32_t durMs) {
 // ---------------------------------------------------------------------------
 // Display + sprite region.
 //
-// Panel: 800x480 on X4/X4 Pro, 792x528 on X3 (BoardConfig::ACTIVE picks the
-// real dimensions at runtime — see "Multi-board support" below). bufo's Icon
-// assets top out at bufo::MAX_ICON_W x MAX_ICON_H = 192x200 (96px source x 2
-// scale — see tools/gif_to_icons.py and README "Asset pipeline"). SPRITE
-// region is sized with margin around that and kept byte-aligned (x and w
-// multiples of 8) so the manual framebuffer inversion used for the
-// `attention` cue below never touches a partial byte at the edges — that
-// margin comfortably fits either panel, so it stays a fixed size across
-// boards; only the panel-relative layout below (PANEL_W, full-screen
-// overlays) reads the runtime panel size.
+// Panel: 800x480 on X4/X4 Pro, 792x528 on X3, 600x400 on M5 PaperColor
+// (BoardConfig::ACTIVE picks the real dimensions at runtime — see
+// "Multi-board support" below). PaperColor's physical panel is 400x600
+// portrait, but Ed2208M5Driver::geometry() (freeink-sdk) always reports the
+// landscape 600x400 logical framebuffer it internally rotates into — see
+// docs/board-notes/papercolor.md "Portrait panel, landscape framebuffer" —
+// so display.getDisplayWidth()/Height() is landscape on every board here and
+// no board-specific layout branch is needed. bufo's Icon assets top out at
+// bufo::MAX_ICON_W x MAX_ICON_H = 192x200 (96px source x 2 scale — see
+// tools/gif_to_icons.py and README "Asset pipeline"). SPRITE region is sized
+// with margin around that and kept byte-aligned (x and w multiples of 8) so
+// the manual framebuffer inversion used for the `attention` cue below never
+// touches a partial byte at the edges — that margin comfortably fits every
+// panel, so it stays a fixed size across boards; only the panel-relative
+// layout below (PANEL_W, full-screen overlays) reads the runtime panel size.
 // ---------------------------------------------------------------------------
 static constexpr int16_t SPRITE_X = 40;
 static constexpr int16_t SPRITE_Y = 40;
@@ -239,8 +248,8 @@ static_assert(SPRITE_W >= bufo::MAX_ICON_W && SPRITE_H >= bufo::MAX_ICON_H,
 // Text/status panel occupies the rest of the panel to the right of (and
 // below) the sprite region. PANEL_TOTAL_W/H and PANEL_W are set once in
 // setup() from display.getDisplayWidth()/Height() once the real board is
-// known (see freeink::selectXteinkDevice() there) — X3's panel is a
-// different size than X4/X4 Pro's, so these can't be compile-time constants.
+// known (see freeink::selectXteinkDevice() there) — every board's panel is a
+// different size, so these can't be compile-time constants.
 static constexpr int16_t PANEL_X = SPRITE_X + SPRITE_W + 24;
 static int16_t PANEL_TOTAL_W = 800;
 static int16_t PANEL_TOTAL_H = 480;
@@ -267,6 +276,16 @@ static DisplayTarget& ui() { return *uiPtr; }
 // of what state the pet is in. Tune this one constant, nothing else.
 static constexpr uint32_t FULL_REFRESH_INTERVAL_MS = 5UL * 60UL * 1000UL;  // 5 minutes
 static uint32_t lastFullRefreshMs = 0;
+
+// PaperColor-only: how often FULL_REFRESH_INTERVAL_MS's mandatory refresh is
+// additionally promoted to a complete OTP waveform (see the call site below
+// and docs/board-notes/papercolor.md "DC-balance fix"). Tracked on its own,
+// slower cadence — not every 5-minute tick — because the complete waveform
+// blocks for ~15s and freeink-sdk/README.md only calls for "roughly hourly"
+// to actually DC-balance the panel; promoting on every mandatory-refresh
+// tick would block 12x more often than that guidance requires.
+static constexpr uint32_t PAPERCOLOR_COMPLETE_WAVEFORM_INTERVAL_MS = 60UL * 60UL * 1000UL;  // 1 hour
+static uint32_t lastCompleteWaveformMs = 0;
 
 static void invertSpriteRegionBytes() {
   uint8_t* fb = display.getFrameBuffer();
@@ -596,9 +615,12 @@ static void applyClockMood(const struct tm& lt, uint32_t now) {
   else                             activeState = (now / 10000 % 5 == 0) ? P_SLEEP : P_IDLE;
 }
 
-static void drawClock(uint32_t now, int16_t y) {
+// Returns the y just below the last thing drawn, so the caller
+// (drawStatusPanel()) can keep its own bottom-anchored content clear of
+// whatever this page actually drew — see the comment at that call site.
+static int16_t drawClock(uint32_t now, int16_t y) {
   struct tm lt;
-  if (!getSoftClock(lt, now)) return;
+  if (!getSoftClock(lt, now)) return y;
   static const char* const MON[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
   static const char* const DOW[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
   char hm[6]; snprintf(hm, sizeof(hm), "%02d:%02d", lt.tm_hour, lt.tm_min);
@@ -610,6 +632,7 @@ static void drawClock(uint32_t now, int16_t y) {
   ui().text(Rect{PANEL_X, y, PANEL_W, 28}, hm, TextStyle{0, TextAlign::Left, Color::Black, 1, true, false});
   y += 32;
   ui().text(Rect{PANEL_X, y, PANEL_W, 20}, dl, TextStyle{0, TextAlign::Left, Color::DarkGray, 1, false, false});
+  return y + 20;
 }
 
 static void drawPips(int16_t x, int16_t y, uint8_t total, uint8_t filled) {
@@ -620,7 +643,8 @@ static void drawPips(int16_t x, int16_t y, uint8_t total, uint8_t filled) {
   }
 }
 
-static void drawPetPage(uint32_t now, int16_t y) {
+// Returns the y just below the last thing drawn — see drawClock()'s comment.
+static int16_t drawPetPage(uint32_t now, int16_t y) {
   char b[48];
   if (ownerName()[0]) snprintf(b, sizeof(b), "%s's %s", ownerName(), petName());
   else snprintf(b, sizeof(b), "%s", petName());
@@ -680,9 +704,11 @@ static void drawPetPage(uint32_t now, int16_t y) {
       y += 18;
     }
   }
+  return y;
 }
 
-static void drawInfoPage(uint32_t now, int16_t y) {
+// Returns the y just below the last thing drawn — see drawClock()'s comment.
+static int16_t drawInfoPage(uint32_t now, int16_t y) {
   char hdr[24];
   snprintf(hdr, sizeof(hdr), "info  %u/%u", infoPage + 1, INFO_PAGES);
   ui().text(Rect{PANEL_X, y, PANEL_W, 24}, hdr, TextStyle{0, TextAlign::Left, Color::Black, 1, true, false});
@@ -773,8 +799,12 @@ static void drawInfoPage(uint32_t now, int16_t y) {
     y += 8;
     ln(Color::DarkGray, "hardware");
     ln(Color::Black, BoardConfig::ACTIVE.name);
-    ln(Color::Black, BoardConfig::isX4Pro() ? "ESP32-S3" : "ESP32-C3");
+    // X4 Pro and M5 PaperColor are both ESP32-S3 (env:xteink_x4pro,
+    // env:papercolor — see docs/board-notes/papercolor.md); every other
+    // board built here (X3/X4, via env:xteink) is ESP32-C3.
+    ln(Color::Black, (BoardConfig::isX4Pro() || BoardConfig::isM5StackPaperColor()) ? "ESP32-S3" : "ESP32-C3");
   }
+  return y;
 }
 
 static void drawPanelBox(int16_t& boxX, int16_t& boxY, int16_t boxW, int16_t boxH) {
@@ -899,11 +929,11 @@ static void drawStatusPanel(uint32_t now) {
     ui().text(Rect{PANEL_X, y, (int16_t)(PANEL_W / 2), 20}, "BACK: deny", TextStyle{0, TextAlign::Left, Color::Black, 1, false, false});
     y += 28;
   } else if (clockActive()) {
-    drawClock(now, y);
+    y = drawClock(now, y);
   } else if (displayMode == DISP_PET) {
-    drawPetPage(now, y);
+    y = drawPetPage(now, y);
   } else if (displayMode == DISP_INFO) {
-    drawInfoPage(now, y);
+    y = drawInfoPage(now, y);
   } else if (settings().hud) {
     snprintf(line, sizeof(line), "sessions %u  running %u  waiting %u", tama.sessionsTotal, tama.sessionsRunning,
              tama.sessionsWaiting);
@@ -934,17 +964,33 @@ static void drawStatusPanel(uint32_t now) {
     }
   }
 
-  y = (int16_t)(PANEL_TOTAL_H - 140);  // bottom-anchored so it stays clear of the
-                                        // content above regardless of panel height
-  PlatformBatteryStatus bat = platformBatteryStatus();
-  snprintf(line, sizeof(line), "battery %d%%  %s", bat.pct, bat.usb ? "usb" : "");
-  ui().text(Rect{PANEL_X, y, PANEL_W, 20}, line, TextStyle{0, TextAlign::Left, Color::DarkGray, 1, false, false});
-  y += 22;
-  snprintf(line, sizeof(line), "ble %s", !bleConnected() ? "-" : bleSecure() ? "encrypted" : "OPEN");
-  ui().text(Rect{PANEL_X, y, PANEL_W, 20}, line, TextStyle{0, TextAlign::Left, Color::DarkGray, 1, false, false});
-  y += 22;
-  snprintf(line, sizeof(line), "Lv %u  tokens %lu", stats().level, (unsigned long)stats().tokens);
-  ui().text(Rect{PANEL_X, y, PANEL_W, 20}, line, TextStyle{0, TextAlign::Left, Color::DarkGray, 1, false, false});
+  // Bottom-anchored so it stays clear of the content above, on every board
+  // where the content above never reaches this far down (X4/X4 Pro: 480-140
+  // = 340; X3: 528-140 = 388). On M5 PaperColor's shorter 400px panel,
+  // several of the branches above (the transcript in `settings().hud`; the
+  // stats list in `drawPetPage()`'s page 0; the longer `drawInfoPage()`
+  // pages — all now returning their real ending `y` into this `y`, not just
+  // the transcript branch) can run past `PANEL_TOTAL_H - 140` on their own,
+  // which `max()` accounts for — but a couple of drawInfoPage()'s denser
+  // pages still run close enough to this panel's actual bottom that even
+  // that adjusted position wouldn't leave room for these 3 lines without
+  // clipping or overlapping whatever's above. Rather than draw a clipped or
+  // overlapping battery/BLE/level block in that case, skip it for that one
+  // frame — the same information is always available on info page 3/4
+  // (battery) and 4 (BLE), so nothing is permanently hidden.
+  y = (int16_t)(y > PANEL_TOTAL_H - 140 ? y : PANEL_TOTAL_H - 140);
+  static constexpr int16_t kBottomBlockH = 64;  // 3 lines, 22px apart, last one 20px tall
+  if (y + kBottomBlockH <= PANEL_TOTAL_H) {
+    PlatformBatteryStatus bat = platformBatteryStatus();
+    snprintf(line, sizeof(line), "battery %d%%  %s", bat.pct, bat.usb ? "usb" : "");
+    ui().text(Rect{PANEL_X, y, PANEL_W, 20}, line, TextStyle{0, TextAlign::Left, Color::DarkGray, 1, false, false});
+    y += 22;
+    snprintf(line, sizeof(line), "ble %s", !bleConnected() ? "-" : bleSecure() ? "encrypted" : "OPEN");
+    ui().text(Rect{PANEL_X, y, PANEL_W, 20}, line, TextStyle{0, TextAlign::Left, Color::DarkGray, 1, false, false});
+    y += 22;
+    snprintf(line, sizeof(line), "Lv %u  tokens %lu", stats().level, (unsigned long)stats().tokens);
+    ui().text(Rect{PANEL_X, y, PANEL_W, 20}, line, TextStyle{0, TextAlign::Left, Color::DarkGray, 1, false, false});
+  }
 
   // Overlays draw last, on top of whatever the panel is currently showing —
   // matches the earlier generation's draw order (menu/settings/reset always
@@ -1303,10 +1349,15 @@ void setup() {
   // Claiming it once here, with the SD MISO included, before display.begin()
   // runs its own SPI.begin(), is exactly the sequence Free-Ink's own X4
   // consumer app (inkdeck, src/main.cpp setup()) uses for this same board.
-  // X4 Pro doesn't need this: its SD card is native SDMMC on entirely
-  // separate pins (CLK41/CMD42/DAT40), not a shared SPI bus — see
-  // freeink-sdk/docs/xteink-x4pro-support.md "Storage".
-  if (!BoardConfig::isX4Pro()) {
+  // M5 PaperColor's SD is wired the same shared-bus way (M5STACK_PAPER_COLOR.sd:
+  // sclk/mosi shared with the display, separateSpi=false — see
+  // docs/board-notes/papercolor.md "Storage"), so it needs this claim too.
+  // X4 Pro is the one board here that doesn't: its SD card is native SDMMC on
+  // entirely separate dedicated pins (BoardConfig::ACTIVE.sdmmc, busWidth !=
+  // 0), not a shared SPI bus — see freeink-sdk/docs/xteink-x4pro-support.md
+  // "Storage". Gating on sdmmc.busWidth rather than naming X4 Pro specifically
+  // keeps this correct for any future native-SDMMC board too.
+  if (BoardConfig::ACTIVE.sdmmc.busWidth == 0) {
     SPI.begin(BoardConfig::ACTIVE.display.sclk, BoardConfig::ACTIVE.sd.miso, BoardConfig::ACTIVE.display.mosi,
               BoardConfig::ACTIVE.display.cs);
   }
@@ -1314,7 +1365,7 @@ void setup() {
   display.begin();
   PANEL_TOTAL_W = display.getDisplayWidth();
   PANEL_TOTAL_H = display.getDisplayHeight();
-  PANEL_W = (int16_t)(PANEL_TOTAL_W - PANEL_X - 16);
+  PANEL_W = PANEL_TOTAL_W - PANEL_X - 16;
   uiPtr = new (uiStorage) DisplayTarget(display.getFrameBuffer(), display.getDisplayWidth(),
                                         display.getDisplayHeight(), display.getDisplayWidthBytes(),
                                         Orientation::LandscapeCounterClockwise);
@@ -1401,6 +1452,20 @@ void loop() {
 
   // Mandatory DC-balance full refresh, independent of activity/state.
   if (now - lastFullRefreshMs > FULL_REFRESH_INTERVAL_MS) {
+    // On PaperColor a plain FULL_REFRESH is interrupted at ~340ms and does NOT
+    // DC-balance the panel (freeink-sdk/README.md "M5Stack PaperColor refresh
+    // behavior") — only a complete OTP waveform does. Promote this refresh on
+    // its own ~hourly cadence (PAPERCOLOR_COMPLETE_WAVEFORM_INTERVAL_MS) so the
+    // "never degrades" guarantee below is actually true on this board without
+    // blocking for the ~15s complete waveform on every 5-minute mandatory-
+    // refresh tick; every other FULL_REFRESH call site (menu nav, celebrate,
+    // etc.) stays on the fast interrupted path regardless. No-op on every
+    // other board (see FreeInkDisplay.h requestCompleteWaveformNextRefresh()).
+    if (BoardConfig::isM5StackPaperColor() &&
+        now - lastCompleteWaveformMs > PAPERCOLOR_COMPLETE_WAVEFORM_INTERVAL_MS) {
+      display.requestCompleteWaveformNextRefresh();
+      lastCompleteWaveformMs = now;
+    }
     display.displayBuffer(EInkDisplay::FULL_REFRESH);
     lastFullRefreshMs = now;
     needsRedraw = false;
