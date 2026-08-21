@@ -1,4 +1,4 @@
-// claude-desktop-buddy — Xteink firmware (X4, X3, X4 Pro).
+// claude-desktop-buddy — Xteink firmware (X4, X3, X4 Pro, Sticky).
 //
 // Nordic UART Service BLE bridge (ble_bridge.cpp/h) + JSON wire protocol
 // (data.h, xfer.h) + NVS-backed stats/owner/settings (stats.h) driving a
@@ -9,18 +9,21 @@
 // settings menu cycle between them — see README.md "SD-backed character
 // packs" and "Menu system".
 //
-// This one file drives three boards, two of which (X4, X3) share one
+// This one file drives four boards, two of which (X4, X3) share one
 // ESP32-C3 binary (env:xteink) picked at runtime by freeink::
-// selectXteinkDevice() in setup(); the third (X4 Pro) is ESP32-S3 and
-// builds separately (env:xteink_x4pro) but runs the same source. Where a
-// board has real hardware the M5-era original also had (X3's IMU/RTC/
-// battery gauge, X4 Pro's touch/frontlight/RTC/gauge), this file uses it via
-// BoardConfig::hasImu()/hasRtc()/isX4Pro() and the Imu/Rtc/FrontlightManager
-// libraries; where a board has none of it (X4: BoardConfig::XTEINK_X4 is
-// NO_SENSORS/NO_AUDIO/NO_LEDS/NO_FRONTLIGHT, no RTC), the same button/
-// software substitutes from the X4-only version remain. See README.md
-// "Multi-board support" for the full capability matrix, and "Menu system"
-// for what's substituted versus real per board.
+// selectXteinkDevice() in setup(); the other two (X4 Pro, Sticky) are
+// ESP32-S3 and build separately (env:xteink_x4pro, env:sticky) but run the
+// same source. Sticky is UNVERIFIED — freeink-sdk marks it an "Upcoming
+// Device" with no hardware validation; see docs/board-notes/sticky.md. Where
+// a board has real hardware the M5-era original also had (X3's IMU/RTC/
+// battery gauge, X4 Pro's touch/frontlight/RTC/gauge, Sticky's RTC/IMU/
+// gauge), this file uses it via BoardConfig::hasImu()/hasRtc()/isX4Pro()/
+// isSticky() and the Imu/Rtc/FrontlightManager libraries; where a board has
+// none of it (X4: BoardConfig::XTEINK_X4 is NO_SENSORS/NO_AUDIO/NO_LEDS/
+// NO_FRONTLIGHT, no RTC), the same button/software substitutes from the
+// X4-only version remain. See README.md "Multi-board support" for the full
+// capability matrix, and "Menu system" for what's substituted versus real
+// per board.
 //
 // See README.md for the sprite-region size, the full-refresh timer
 // interval, and the full input mapping.
@@ -773,7 +776,9 @@ static void drawInfoPage(uint32_t now, int16_t y) {
     y += 8;
     ln(Color::DarkGray, "hardware");
     ln(Color::Black, BoardConfig::ACTIVE.name);
-    ln(Color::Black, BoardConfig::isX4Pro() ? "ESP32-S3" : "ESP32-C3");
+    // X4 Pro and Sticky are both ESP32-S3 builds; X3/X4 are ESP32-C3 (see the
+    // file header comment for the board-to-MCU-family mapping).
+    ln(Color::Black, (BoardConfig::isX4Pro() || BoardConfig::isSticky()) ? "ESP32-S3" : "ESP32-C3");
   }
 }
 
@@ -1292,21 +1297,29 @@ void setup() {
   bool isX3 = freeink::selectXteinkDevice();
   if (isX3) display.setDisplayX3();
 
-  // X3/X4 share the display's SPI bus with the SD card slot (BoardConfig::
-  // XTEINK_X4.sd: sclk/mosi unassigned, separateSpi=false — miso(7) and
-  // cs(12) are the only pins unique to the card). FreeInkDisplay::begin()
-  // only wires MISO into the bus when the active panel driver needs it
-  // (PanelDriver::spiMiso() defaults to -1 for SSD1677/X4 — the display
-  // itself is write-only); left alone, the bus would come up with no MISO
-  // pin and SD reads would never work afterward, since a second SPI.begin()
-  // with different pins is unreliable once the bus is already initialized.
+  // X3/X4/Sticky share the display's SPI bus with the SD card slot
+  // (BoardConfig::XTEINK_X4.sd / STICKY.sd: separateSpi=false — the card
+  // reuses the display's sclk/mosi pins). FreeInkDisplay::begin() only wires
+  // MISO into the bus when the active panel driver needs it
+  // (PanelDriver::spiMiso() defaults to -1 for SSD1677 — the display itself
+  // is write-only); left alone, the bus would come up with no MISO pin and
+  // SD reads would never work afterward, since a second SPI.begin() with
+  // different pins is unreliable once the bus is already initialized.
   // Claiming it once here, with the SD MISO included, before display.begin()
   // runs its own SPI.begin(), is exactly the sequence Free-Ink's own X4
   // consumer app (inkdeck, src/main.cpp setup()) uses for this same board.
-  // X4 Pro doesn't need this: its SD card is native SDMMC on entirely
-  // separate pins (CLK41/CMD42/DAT40), not a shared SPI bus — see
-  // freeink-sdk/docs/xteink-x4pro-support.md "Storage".
-  if (!BoardConfig::isX4Pro()) {
+  //
+  // Boards whose SD card is native SDMMC on entirely separate pins (X4 Pro:
+  // freeink-sdk/docs/xteink-x4pro-support.md "Storage") don't share a bus at
+  // all, so this pre-claim would be wrong for them. That's a general board
+  // fact, not an X4-Pro-specific one — BoardConfig::ACTIVE.sdmmc.busWidth != 0
+  // is the same "does this board use native SDMMC instead of SPI/SdFat" test
+  // SDCardManager itself uses, so check it directly instead of hardcoding
+  // isX4Pro(). (Sticky is NOT SDMMC — BoardConfig.h:1347 NO_SDMMC, and its SD
+  // pins alias the display bus like X3/X4 — so it stays on this pre-claim
+  // path; verify against real hardware once a unit exists, per
+  // docs/board-notes/sticky.md.)
+  if (BoardConfig::ACTIVE.sdmmc.busWidth == 0) {
     SPI.begin(BoardConfig::ACTIVE.display.sclk, BoardConfig::ACTIVE.sd.miso, BoardConfig::ACTIVE.display.mosi,
               BoardConfig::ACTIVE.display.cs);
   }
