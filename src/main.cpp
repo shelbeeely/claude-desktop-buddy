@@ -773,7 +773,10 @@ static void drawInfoPage(uint32_t now, int16_t y) {
     y += 8;
     ln(Color::DarkGray, "hardware");
     ln(Color::Black, BoardConfig::ACTIVE.name);
-    ln(Color::Black, BoardConfig::isX4Pro() ? "ESP32-S3" : "ESP32-C3");
+    // X4 Pro and de-link are both ESP32-S3 builds; X3/X4 (env:xteink) are the
+    // only ESP32-C3 boards. OR'd here rather than a new BoardConfig MCU-family
+    // field, since this info line is the only place that needs it.
+    ln(Color::Black, (BoardConfig::isX4Pro() || BoardConfig::isDeLink()) ? "ESP32-S3" : "ESP32-C3");
   }
 }
 
@@ -1303,10 +1306,15 @@ void setup() {
   // Claiming it once here, with the SD MISO included, before display.begin()
   // runs its own SPI.begin(), is exactly the sequence Free-Ink's own X4
   // consumer app (inkdeck, src/main.cpp setup()) uses for this same board.
-  // X4 Pro doesn't need this: its SD card is native SDMMC on entirely
-  // separate pins (CLK41/CMD42/DAT40), not a shared SPI bus — see
-  // freeink-sdk/docs/xteink-x4pro-support.md "Storage".
-  if (!BoardConfig::isX4Pro()) {
+  // Boards with native SDMMC (X4 Pro: 1-bit; de-link: 4-bit — BoardConfig.h
+  // DE_LINK.sdmmc, ~line 1108) don't need this: their SD card is on entirely
+  // separate pins, not a shared SPI bus — see
+  // freeink-sdk/docs/xteink-x4pro-support.md "Storage". Checking
+  // ACTIVE.sdmmc.busWidth (0 = SPI/SdFat board, nonzero = native SDMMC —
+  // see BoardConfig.h's SdmmcPins comment, ~line 434) instead of naming X4
+  // Pro specifically means this guard stays correct for any future
+  // native-SDMMC board without another per-board branch here.
+  if (BoardConfig::ACTIVE.sdmmc.busWidth == 0) {
     SPI.begin(BoardConfig::ACTIVE.display.sclk, BoardConfig::ACTIVE.sd.miso, BoardConfig::ACTIVE.display.mosi,
               BoardConfig::ACTIVE.display.cs);
   }
