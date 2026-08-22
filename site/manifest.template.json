@@ -1,0 +1,19 @@
+{
+  "name": "Free Ink Claude Buddy — Xteink",
+  "version": "__VERSION__",
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32-C3",
+      "parts": [
+        { "path": "firmware/xteink.bin", "offset": 0 }
+      ]
+    },
+    {
+      "chipFamily": "ESP32-S3",
+      "parts": [
+        { "path": "firmware/xteink_x4pro.bin", "offset": 0 }
+      ]
+    }
+  ]
+}

@@ -63,7 +63,10 @@ inline void statsSave() {
 // Level is token-driven now; approvals only feed mood/velocity.
 inline void statsOnApproval(uint32_t secondsToRespond) {
   _stats.approvals++;
-  _stats.velocity[_stats.velIdx] = (uint16_t)min(secondsToRespond, 65535u);
+  // Not std::min(secondsToRespond, 65535u): uint32_t is `long unsigned int`
+  // on this toolchain, distinct from the unsigned-int literal's type, which
+  // makes template argument deduction ambiguous.
+  _stats.velocity[_stats.velIdx] = (uint16_t)(secondsToRespond > 65535u ? 65535u : secondsToRespond);
   _stats.velIdx = (_stats.velIdx + 1) % 8;
   if (_stats.velCount < 8) _stats.velCount++;
   _dirty = true; statsSave();
@@ -174,42 +177,6 @@ inline uint8_t statsFedProgress() {
   return (uint8_t)((_stats.tokens % TOKENS_PER_LEVEL) / (TOKENS_PER_LEVEL / 10));
 }
 
-// --- Settings --------------------------------------------------------------
-
-struct Settings {
-  bool sound;
-  bool bt;
-  bool wifi;     // placeholder — no WiFi stack linked yet, just stores the pref
-  bool led;
-  bool hud;
-  uint8_t clockRot;  // 0=auto 1=portrait 2=landscape
-};
-
-static Settings _settings = { true, true, false, true, true, 0 };
-
-inline void settingsLoad() {
-  _prefs.begin("buddy", true);
-  _settings.sound = _prefs.getBool("s_snd", true);
-  _settings.bt    = _prefs.getBool("s_bt",  true);
-  _settings.wifi  = _prefs.getBool("s_wifi",false);
-  _settings.led   = _prefs.getBool("s_led", true);
-  _settings.hud      = _prefs.getBool("s_hud", true);
-  _settings.clockRot = _prefs.getUChar("s_crot", 0);
-  if (_settings.clockRot > 2) _settings.clockRot = 0;
-  _prefs.end();
-}
-
-inline void settingsSave() {
-  _prefs.begin("buddy", false);
-  _prefs.putBool("s_snd", _settings.sound);
-  _prefs.putBool("s_bt",  _settings.bt);
-  _prefs.putBool("s_wifi",_settings.wifi);
-  _prefs.putBool("s_led", _settings.led);
-  _prefs.putBool("s_hud", _settings.hud);
-  _prefs.putUChar("s_crot", _settings.clockRot);
-  _prefs.end();
-}
-
 static char _petName[24] = "Buddy";
 static char _ownerName[32] = "";
 
@@ -250,19 +217,48 @@ inline void ownerSet(const char* name) {
 
 inline const char* ownerName() { return _ownerName; }
 
-inline uint8_t speciesIdxLoad() {
+inline const Stats& stats() { return _stats; }
+
+// Trimmed from the earlier desktop-buddy generation's Settings struct: sound/
+// bluetooth/wifi/clockRot had no X4 equivalent (no buzzer, BT/WiFi toggles
+// were stored-only even on the original board, clockRot needed IMU
+// orientation this board doesn't have). `led` is renamed `flash` — X4 has no
+// LED, but this still gates the bit-inverted sprite blink that substitutes
+// for one during `attention`.
+struct Settings {
+  bool hud = true;
+  bool flash = true;
+};
+static Settings _settings;
+
+inline void settingsLoad() {
   _prefs.begin("buddy", true);
-  uint8_t v = _prefs.getUChar("species", 0xFF);
+  _settings.hud = _prefs.getBool("hud", true);
+  _settings.flash = _prefs.getBool("flash", true);
   _prefs.end();
-  return v;
 }
 
-inline void speciesIdxSave(uint8_t idx) {
+inline void settingsSave() {
   _prefs.begin("buddy", false);
-  _prefs.putUChar("species", idx);
+  _prefs.putBool("hud", _settings.hud);
+  _prefs.putBool("flash", _settings.flash);
   _prefs.end();
 }
 
 inline Settings& settings() { return _settings; }
 
-inline const Stats& stats() { return _stats; }
+// Persists which installed character (index into main.cpp's characterList —
+// 0 is always the compiled-in bufo, 1..N are SD .charpack files) to reopen
+// on the next boot. Replaces the earlier generation's speciesIdx.
+inline uint8_t characterIdxLoad() {
+  _prefs.begin("buddy", true);
+  uint8_t v = _prefs.getUChar("charidx", 0);
+  _prefs.end();
+  return v;
+}
+
+inline void characterIdxSave(uint8_t idx) {
+  _prefs.begin("buddy", false);
+  _prefs.putUChar("charidx", idx);
+  _prefs.end();
+}

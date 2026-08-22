@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Free Ink Claude Buddy — Xteink flasher</title>
+<script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff;
+    --fg: #1a1a1a;
+    --dim: #6b6b6b;
+    --border: #d9d9d9;
+    --accent: #c15f3c;
+    --code-bg: #f4f2ef;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16140f;
+      --fg: #f0ece4;
+      --dim: #a39a8c;
+      --border: #3a352c;
+      --accent: #e08a63;
+      --code-bg: #221f18;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  main {
+    max-width: 640px;
+    margin: 0 auto;
+    padding: 48px 20px 80px;
+  }
+  h1 {
+    font-size: 1.5rem;
+    margin: 0 0 4px;
+  }
+  .sub {
+    color: var(--dim);
+    margin: 0 0 32px;
+    font-size: 0.95rem;
+  }
+  h2 {
+    font-size: 1.05rem;
+    margin: 36px 0 10px;
+    border-top: 1px solid var(--border);
+    padding-top: 24px;
+  }
+  p { margin: 0 0 12px; }
+  ol, ul { margin: 0 0 12px; padding-left: 22px; }
+  li { margin-bottom: 6px; }
+  code {
+    background: var(--code-bg);
+    padding: 0.1em 0.4em;
+    border-radius: 4px;
+    font-size: 0.9em;
+  }
+  pre {
+    background: var(--code-bg);
+    padding: 12px 14px;
+    border-radius: 6px;
+    overflow-x: auto;
+    font-size: 0.85rem;
+  }
+  a { color: var(--accent); }
+  .install-row {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    margin: 20px 0;
+    padding: 18px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+  }
+  esp-web-install-button {
+    --esp-tools-button-color: #fff;
+    --esp-tools-button-bg-color: var(--accent);
+  }
+  .browser-warning {
+    display: none;
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+    font-size: 0.9rem;
+    margin-bottom: 20px;
+  }
+  .browser-warning.show { display: block; }
+  .version {
+    color: var(--dim);
+    font-size: 0.85rem;
+  }
+  footer {
+    margin-top: 48px;
+    padding-top: 20px;
+    border-top: 1px solid var(--border);
+    color: var(--dim);
+    font-size: 0.85rem;
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>Free Ink Claude Buddy — Xteink</h1>
+  <p class="sub">Flash the FreeInk-based desk-pet firmware straight from this page — X4, X3, or X4 Pro. No local toolchain needed.</p>
+
+  <div id="browser-warning" class="browser-warning">
+    This browser doesn't support <a href="https://developer.mozilla.org/en-US/docs/Web/API/Web_Serial_API" target="_blank" rel="noopener">Web Serial</a>,
+    which flashing over USB needs. Open this page in desktop <strong>Chrome</strong> or <strong>Edge</strong> instead —
+    it won't work on Firefox, Safari, or mobile browsers. You can still flash manually; see
+    <a href="#manual">manual flashing</a> below.
+  </div>
+
+  <h2>1. Connect</h2>
+  <p>Plug your Xteink device (X4, X3, or X4 Pro) into your computer with a USB-C cable.</p>
+
+  <h2>2. Install</h2>
+  <div class="install-row">
+    <esp-web-install-button manifest="manifest.json"></esp-web-install-button>
+    <span class="version">build info in the manifest, updated on every push to <code>main</code></span>
+  </div>
+  <p>
+    Click <strong>Connect</strong>, pick the device's serial port from the browser prompt, then
+    <strong>Install</strong>. This erases the device and writes the full image (bootloader,
+    partition table, and app) in one pass. The manifest carries builds for both chip families
+    (ESP32-C3 for X4/X3, ESP32-S3 for X4 Pro) — ESP Web Tools reads the connected chip and picks
+    the matching one automatically, so this one button covers all three boards.
+  </p>
+  <p>
+    If nothing shows up in the port picker, or the install stalls right after connecting: hold the
+    <strong>BOOT</strong> button while plugging in the USB cable, then try Connect again. These
+    boards use their native USB port for serial rather than a separate USB-UART bridge chip, and
+    whether the browser can reset them into the bootloader automatically hasn't been confirmed on
+    hardware yet — holding BOOT forces it into download mode regardless.
+  </p>
+
+  <h2 id="manual">Manual flashing (fallback)</h2>
+  <p>
+    If the web installer doesn't work for your setup, download the merged image for your board from
+    this build and flash it with <a href="https://docs.espressif.com/projects/esptool/en/latest/" target="_blank" rel="noopener">esptool</a>
+    directly:
+  </p>
+  <p><strong>X4 / X3</strong> (ESP32-C3):</p>
+  <pre>pip install esptool
+esptool --chip esp32c3 --port /dev/ttyACM0 write-flash 0x0 xteink.bin</pre>
+  <p><a href="firmware/xteink.bin">Download xteink.bin</a> (single merged image, flash at offset 0x0).</p>
+  <p><strong>X4 Pro</strong> (ESP32-S3):</p>
+  <pre>pip install esptool
+esptool --chip esp32s3 --port /dev/ttyACM0 write-flash 0x0 xteink_x4pro.bin</pre>
+  <p><a href="firmware/xteink_x4pro.bin">Download xteink_x4pro.bin</a> (single merged image, flash at offset 0x0).</p>
+
+  <h2>Source</h2>
+  <p>
+    Built automatically from <a href="https://github.com/shelbeeely/claude-desktop-buddy" target="_blank" rel="noopener">shelbeeely/claude-desktop-buddy</a>
+    (<code>env:xteink</code> for X4/X3, <code>env:xteink_x4pro</code> for X4 Pro) on every push to
+    <code>main</code> — see
+    <a href="https://github.com/shelbeeely/claude-desktop-buddy/blob/main/README.md#known-limitations" target="_blank" rel="noopener">README.md "Known limitations"</a>
+    for hardware details and known unverified assumptions.
+  </p>
+
+  <footer>
+    Nothing typed or flashed here leaves your browser except what your browser sends directly to the
+    connected device over USB — this page has no backend.
+  </footer>
+</main>
+<script>
+  if (!("serial" in navigator)) {
+    document.getElementById("browser-warning").classList.add("show");
+  }
+</script>
+</body>
+</html>
