@@ -1556,13 +1556,14 @@ static void handleInput(uint32_t now) {
 }
 
 void setup() {
-  // LilyGo T5 S3 only (BoardConfig::LILYGO_T5S3.power.latch0 = GPIO2; every
-  // other board's power.latch0/1 default to PIN_UNASSIGNED, which this
-  // no-ops on): a battery-latched board must drive its hold pin HIGH before
-  // anything else or it powers off the instant USB is unplugged — same
-  // requirement as the Sticky/M5Paper v1.1 units (see
-  // freeink-sdk/libs/hardware/BoardConfig/include/BoardConfig.h
-  // holdPowerRails()). Safe and inert to call unconditionally on every board.
+  // Battery-latched boards (LilyGo T5 S3: BoardConfig::LILYGO_T5S3.power.
+  // latch0 = GPIO2; M5Paper v1.1: M5PAPER_V11.power.latch0 = GPIO2 too — a
+  // MOSFET-latched supply, same pattern) must drive their hold pin HIGH
+  // before anything else, or the board powers off the instant USB is
+  // unplugged (freeink-sdk platformio.sample.ini "POWER LATCH" comment,
+  // BoardConfig.h). Every other board's power.latch0/1 default to
+  // PIN_UNASSIGNED, on which holdPowerRails() is a documented no-op, so
+  // this is safe and inert to call unconditionally on every board.
   BoardConfig::holdPowerRails();
 
   Serial.begin(115200);
