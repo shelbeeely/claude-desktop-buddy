@@ -37,6 +37,14 @@
 // PaperS3 has NO physical buttons at all —
 // see the "PaperS3 touch-only navigation" block near handleInput() below.
 //
+// Screens and input dispatch run on the SDK's FreeInkApp framework
+// (freeink-sdk/libs/ui/FreeInkUI/include/FreeInkApp.h) instead of a hand-
+// rolled state machine — see docs/freeinkapp-migration.md for the screen
+// model, the overlay-screen decision, and the input-routing split between
+// real FreeInkApp action dispatch (BACK) and hand-rolled polling (CONFIRM/
+// UP/DOWN, which need tap-vs-hold disambiguation InputSnapshot has no slot
+// for on physical buttons).
+//
 // See README.md for the sprite-region size, the full-refresh timer
 // interval, and the full input mapping.
 
@@ -49,6 +57,7 @@
 #include <InputManager.h>
 #include <BatteryMonitor.h>
 #include <FreeInkUIDisplayTarget.h>
+#include <FreeInkApp.h>
 #include <SDCardManager.h>
 #include <PowerManager.h>
 #include <XteinkDetect.h>
@@ -82,11 +91,18 @@
 #include "assets/icons_bufo.h"
 #include "sd_character_pack.h"
 
+using freeink::ui::ActionEvent;
 using freeink::ui::Color;
 using freeink::ui::DisplayTarget;
+using freeink::ui::InputBack;
+using freeink::ui::InputSnapshot;
+using freeink::ui::ListItem;
+using freeink::ui::ListProps;
+using freeink::ui::NO_ACTION;
 using freeink::ui::Orientation;
 using freeink::ui::Paint;
 using freeink::ui::Rect;
+using freeink::ui::RefreshHint;
 using freeink::ui::TextAlign;
 using freeink::ui::TextStyle;
 
@@ -295,16 +311,20 @@ InputManager input;
 // only allocates at runtime (it's null before that) — constructing this as an
 // eagerly-initialized global would capture a null pointer, since global
 // constructors run before setup(). Built lazily in setup() after begin()
-// instead; ui() below is the only accessor.
+// instead; ui() below is the only accessor. This is also the exact DrawTarget
+// FreeInkApp renders into (gApp below is constructed with `ui()`) — screen
+// functions and these free-standing draw helpers share one target, so a
+// helper written against `ui()` needs no change to be called from a
+// FreeInkApp screen function.
 alignas(DisplayTarget) static unsigned char uiStorage[sizeof(DisplayTarget)];
 static DisplayTarget* uiPtr = nullptr;
 static DisplayTarget& ui() { return *uiPtr; }
 
 // --- Mandatory DC-balance timer ---------------------------------------------
-// Independent of activity: a long busy/idle stretch runs only partial/fast
-// refreshes over the sprite region, which never DC-balances the panel.
-// Force a FULL_REFRESH of the whole screen on this fixed cadence regardless
-// of what state the pet is in. Tune this one constant, nothing else.
+// Independent of activity: a long busy/idle stretch runs only fast refreshes
+// over the sprite region, which never DC-balances the panel. Force a full
+// refresh of the whole screen on this fixed cadence regardless of what state
+// the pet is in. Tune this one constant, nothing else.
 static constexpr uint32_t FULL_REFRESH_INTERVAL_MS = 5UL * 60UL * 1000UL;  // 5 minutes
 static uint32_t lastFullRefreshMs = 0;
 
@@ -453,61 +473,67 @@ static bool getCurrentIcon(PersonaState state, uint32_t now, uint32_t stateEnter
 // --- Refresh strategy --------------------------------------------------------
 // See README "Refresh strategy" for the rationale behind each state's
 // cadence/mode. Nothing here is uniform on purpose.
+//
+// Pre-migration this drove display.displayWindow()/displayBuffer() calls
+// directly. FreeInkApp owns the actual panel push now (its RefreshHint,
+// read via app.lastRenderRefreshHint() and pushed once per loop tick with
+// freeink::ui::present() — see loop()), so these functions instead redraw
+// into the shared framebuffer on the same cadence as before and report back
+// what refresh strength that redraw deserves; the caller (screenMain, see
+// below) forwards it to gApp->invalidate().
 static uint32_t stateEnteredMs = 0;
 static uint32_t lastSpriteDrawMs = 0;
 static bool     sleepFrameDrawn = false;
 static bool     attentionFlashOn = false;
 
-// Menu/settings/reset overlays and the pairing-passkey screen replace the
-// whole panel (they're modal, matching the earlier generation's floating
-// menu box) — pausing sprite animation underneath avoids partial-refresh
-// artifacts flickering through a static box. Nap (see "Nap" below) pauses
-// it too.
-static bool overlayOpen = false;
+// Nap (see "Nap" below) pauses sprite animation, same as it did pre-
+// migration; the menu/settings/reset/passkey "pause animation underneath"
+// behavior is now automatic — those are separate FreeInkApp screens, so
+// screenMain (and this function) simply doesn't run while one is active.
 static bool napping = false;
 static uint32_t napStartMs = 0;
 static bool napFrameDrawn = false;
 
-static void renderSprite(uint32_t now) {
-  if (overlayOpen || napping) return;
-
+// Redraws the sprite region if this state's cadence says it's due, and
+// reports the refresh strength that redraw deserves (RefreshHint::None if
+// nothing was redrawn this tick).
+static RefreshHint renderSprite(uint32_t now) {
   switch (activeState) {
     case P_SLEEP:
-      if (sleepFrameDrawn) return;
+      if (sleepFrameDrawn) return RefreshHint::None;
       clearSpriteRegion();
       {
         freeink::Icon icon;
         if (getCurrentIcon(P_SLEEP, now, stateEnteredMs, icon)) drawIconCentered(icon);
       }
-      display.displayWindow(SPRITE_X, SPRITE_Y, SPRITE_W, SPRITE_H);
       sleepFrameDrawn = true;
-      return;
+      return RefreshHint::Fast;
 
     case P_IDLE:
-      if (now - lastSpriteDrawMs < 1500) return;
+      if (now - lastSpriteDrawMs < 1500) return RefreshHint::None;
       clearSpriteRegion();
       {
         freeink::Icon icon;
         if (getCurrentIcon(P_IDLE, now, stateEnteredMs, icon)) drawIconCentered(icon);
       }
-      display.displayWindow(SPRITE_X, SPRITE_Y, SPRITE_W, SPRITE_H);
-      break;
+      lastSpriteDrawMs = now;
+      return RefreshHint::Fast;
 
     case P_BUSY:
-      if (now - lastSpriteDrawMs < 350) return;
+      if (now - lastSpriteDrawMs < 350) return RefreshHint::None;
       clearSpriteRegion();
       {
         freeink::Icon icon;
         if (getCurrentIcon(P_BUSY, now, stateEnteredMs, icon)) drawIconCentered(icon);
       }
-      display.displayWindow(SPRITE_X, SPRITE_Y, SPRITE_W, SPRITE_H);
-      break;
+      lastSpriteDrawMs = now;
+      return RefreshHint::Fast;
 
     case P_ATTENTION: {
       // No LED on this board. Substitute cue (gated by settings().flash,
       // the renamed "led" toggle): alternate the sprite region between the
       // normal icon and a bit-inverted version of it.
-      if (now - lastSpriteDrawMs < 400) return;
+      if (now - lastSpriteDrawMs < 400) return RefreshHint::None;
       clearSpriteRegion();
       {
         freeink::Icon icon;
@@ -517,66 +543,71 @@ static void renderSprite(uint32_t now) {
         attentionFlashOn = !attentionFlashOn;
         if (attentionFlashOn) invertSpriteRegionBytes();
       }
-      display.displayWindow(SPRITE_X, SPRITE_Y, SPRITE_W, SPRITE_H);
-      break;
+      lastSpriteDrawMs = now;
+      return RefreshHint::Fast;
     }
 
     case P_CELEBRATE: {
-      if (now - lastSpriteDrawMs < 220) return;
+      if (now - lastSpriteDrawMs < 220) return RefreshHint::None;
       clearSpriteRegion();
       freeink::Icon icon;
-      if (!getCurrentIcon(P_CELEBRATE, now, stateEnteredMs, icon)) break;
+      // Unlike every other case above, a missing frame here skips the push
+      // entirely (matching pre-migration's `if (!getCurrentIcon(...)) break;`)
+      // rather than falling through to drawIconCentered() on nothing — this
+      // state alone requests a full-panel refresh, so drawing that refresh
+      // over a blanked region for no reason would be a needless ~2s block.
+      if (!getCurrentIcon(P_CELEBRATE, now, stateEnteredMs, icon)) return RefreshHint::None;
       drawIconCentered(icon);
-      display.displayBuffer(EInkDisplay::FULL_REFRESH);
-      lastFullRefreshMs = now;
-      break;
+      lastSpriteDrawMs = now;
+      return RefreshHint::Full;
     }
 
     case P_DIZZY:
-      if (now - lastSpriteDrawMs < 200) return;
+      if (now - lastSpriteDrawMs < 200) return RefreshHint::None;
       clearSpriteRegion();
       {
         freeink::Icon icon;
         if (getCurrentIcon(P_DIZZY, now, stateEnteredMs, icon)) drawIconCentered(icon);
       }
-      display.displayWindow(SPRITE_X, SPRITE_Y, SPRITE_W, SPRITE_H);
-      break;
+      lastSpriteDrawMs = now;
+      return RefreshHint::Fast;
 
     case P_HEART:
-      if (now - lastSpriteDrawMs < 250) return;
+      if (now - lastSpriteDrawMs < 250) return RefreshHint::None;
       clearSpriteRegion();
       {
         freeink::Icon icon;
         if (getCurrentIcon(P_HEART, now, stateEnteredMs, icon)) drawIconCentered(icon);
       }
-      display.displayWindow(SPRITE_X, SPRITE_Y, SPRITE_W, SPRITE_H);
-      break;
+      lastSpriteDrawMs = now;
+      return RefreshHint::Fast;
 
     default:
-      return;
+      return RefreshHint::None;
   }
-  lastSpriteDrawMs = now;
 }
 
 // One static frame (the sleep icon + a "napping" tag) while napping, drawn
 // once on entry — mirrors P_SLEEP's draw-once pattern above.
-static void renderNapFrame() {
-  if (napFrameDrawn) return;
+static RefreshHint renderNapFrame() {
+  if (napFrameDrawn) return RefreshHint::None;
   clearSpriteRegion();
   freeink::Icon icon;
   if (getCurrentIcon(P_SLEEP, millis(), stateEnteredMs, icon)) drawIconCentered(icon);
   ui().text(Rect{SPRITE_X, SPRITE_Y + SPRITE_H - 24, SPRITE_W, 20}, "napping...",
             TextStyle{0, TextAlign::Center, Color::DarkGray, 1, false, false});
-  display.displayWindow(SPRITE_X, SPRITE_Y, SPRITE_W, SPRITE_H);
   napFrameDrawn = true;
+  return RefreshHint::Fast;
 }
 
 // ---------------------------------------------------------------------------
 // Display modes, menu, settings, reset — mirrors the earlier desktop-buddy
 // generation's DISP_NORMAL/PET/INFO + menuOpen/settingsOpen/resetOpen
-// structure. Unlike that build, PET/INFO don't shrink the character sprite
-// to a "peek" size — the sprite region keeps showing the pet regardless of
-// mode, since the X4's panel has room for both at once.
+// structure, now expressed as FreeInkApp screens (see docs/
+// freeinkapp-migration.md "Screen model"). Unlike that build, PET/INFO
+// don't shrink the character sprite to a "peek" size — the sprite region
+// keeps showing the pet regardless of mode, since the X4's panel has room
+// for both at once.
 // ---------------------------------------------------------------------------
 enum DisplayMode : uint8_t { DISP_NORMAL, DISP_PET, DISP_INFO, DISP_COUNT };
 static DisplayMode displayMode = DISP_NORMAL;
@@ -589,12 +620,10 @@ static uint8_t infoPage = 0;
 static constexpr uint8_t PET_PAGES = 2;
 static uint8_t petPage = 0;
 
-static bool    menuOpen = false;
 static uint8_t menuSel = 0;
 static const char* const menuItems[] = {"settings", "turn off", "help", "about", "demo", "close"};
 static constexpr uint8_t MENU_N = 6;
 
-static bool    settingsOpen = false;
 static uint8_t settingsSel = 0;
 // "brightness" only makes sense on a board with a frontlight (X4 Pro) — the
 // item list and count are picked once in setup() from frontlight.present(),
@@ -605,14 +634,20 @@ static const char* const* settingsItems = SETTINGS_ITEMS_BASE;
 static uint8_t SETTINGS_N = 5;
 static bool    hasBrightnessItem = false;
 
-static bool     resetOpen = false;
 static uint8_t  resetSel = 0;
 static const char* const resetItems[] = {"delete char", "factory reset", "back"};
 static constexpr uint8_t RESET_N = 3;
 static uint32_t resetConfirmUntil = 0;
 static uint8_t  resetConfirmIdx = 0xFF;
 
-static bool needsRedraw = false;  // set by input handlers to force an immediate panel refresh
+// Which FreeInkApp screen is active. FreeInkApp itself has no screen-stack
+// concept (setScreen() just swaps a function pointer — see FreeInkApp.h),
+// so this is purely this file's own bookkeeping for the hand-rolled parts
+// of input dispatch (CONFIRM tap/hold — see dispatchConfirmTap/Hold below)
+// that need to know "what's on screen right now" without re-deriving it
+// from FreeInkApp state every time.
+enum ScreenId : uint8_t { SCR_MAIN, SCR_MENU, SCR_SETTINGS, SCR_RESET, SCR_SLEEP };
+static ScreenId currentScreen = SCR_MAIN;
 
 // --- Status/text panel -------------------------------------------------------
 static bool responseSent = false;
@@ -633,9 +668,13 @@ static void sendCmd(const char* json) {
   bleWrite((const uint8_t*)"\n", 1);
 }
 
+// Only ever evaluated from within screenMain (see below), so — unlike the
+// pre-migration version — there's no need to check "is an overlay open":
+// while the menu/settings/reset screen is active, screenMain doesn't run at
+// all.
 static bool clockActive() {
   bool inPrompt = tama.promptId[0] && !responseSent;
-  return displayMode == DISP_NORMAL && !overlayOpen && !inPrompt
+  return displayMode == DISP_NORMAL && !inPrompt
       && tama.sessionsRunning == 0 && tama.sessionsWaiting == 0
       && (rtcAvailable || swClockValid) && platformBatteryStatus().usb;
 }
@@ -851,75 +890,6 @@ static int16_t drawInfoPage(uint32_t now, int16_t y) {
   return y;
 }
 
-static void drawPanelBox(int16_t& boxX, int16_t& boxY, int16_t boxW, int16_t boxH) {
-  boxX = (int16_t)((PANEL_TOTAL_W - boxW) / 2);
-  boxY = (int16_t)((PANEL_TOTAL_H - boxH) / 2);
-  ui().fill(Rect{boxX, boxY, boxW, boxH}, Paint::solid(Color::White), 10);
-  ui().stroke(Rect{boxX, boxY, boxW, boxH}, Paint::solid(Color::Black), 2, 10);
-}
-
-static void drawMenuItem(int16_t x, int16_t y, int16_t w, const char* label, const char* value, bool sel) {
-  char line[48];
-  snprintf(line, sizeof(line), "%s%s", sel ? "> " : "  ", label);
-  ui().text(Rect{x, y, (int16_t)(w - (value ? 100 : 0)), 24}, line,
-            TextStyle{0, TextAlign::Left, sel ? Color::Black : Color::DarkGray, 1, sel, false});
-  if (value) {
-    ui().text(Rect{(int16_t)(x + w - 100), y, 100, 24}, value,
-              TextStyle{0, TextAlign::Right, Color::DarkGray, 1, false, false});
-  }
-}
-
-static void drawMenuFooter(int16_t x, int16_t y, int16_t w) {
-  ui().text(Rect{x, y, w, 20}, "CONFIRM: next   BACK: select",
-            TextStyle{0, TextAlign::Left, Color::DarkGray, 1, false, false});
-}
-
-static void drawMenu() {
-  int16_t boxX, boxY;
-  int16_t boxW = 340, boxH = (int16_t)(20 + MENU_N * 30 + 30);
-  drawPanelBox(boxX, boxY, boxW, boxH);
-  int16_t y = (int16_t)(boxY + 10);
-  for (uint8_t i = 0; i < MENU_N; i++) {
-    const char* value = (i == 4) ? (dataDemo() ? "on" : "off") : nullptr;
-    drawMenuItem((int16_t)(boxX + 12), y, (int16_t)(boxW - 24), menuItems[i], value, i == menuSel);
-    y += 30;
-  }
-  drawMenuFooter((int16_t)(boxX + 12), (int16_t)(y + 4), (int16_t)(boxW - 24));
-}
-
-static void drawSettings() {
-  int16_t boxX, boxY;
-  int16_t boxW = 340, boxH = (int16_t)(20 + SETTINGS_N * 30 + 30);
-  drawPanelBox(boxX, boxY, boxW, boxH);
-  int16_t y = (int16_t)(boxY + 10);
-  Settings& s = settings();
-  char valbuf[24];
-  for (uint8_t i = 0; i < SETTINGS_N; i++) {
-    const char* value = nullptr;
-    if (i == 0) value = s.hud ? "on" : "off";
-    else if (i == 1) value = s.flash ? "on" : "off";
-    else if (i == 2) { snprintf(valbuf, sizeof(valbuf), "%u/%u", characterIdx + 1, characterCount); value = valbuf; }
-    else if (hasBrightnessItem && i == 3) { snprintf(valbuf, sizeof(valbuf), "%u/5", brightLevel + 1); value = valbuf; }
-    drawMenuItem((int16_t)(boxX + 12), y, (int16_t)(boxW - 24), settingsItems[i], value, i == settingsSel);
-    y += 30;
-  }
-  drawMenuFooter((int16_t)(boxX + 12), (int16_t)(y + 4), (int16_t)(boxW - 24));
-}
-
-static void drawReset(uint32_t now) {
-  int16_t boxX, boxY;
-  int16_t boxW = 340, boxH = (int16_t)(20 + RESET_N * 30 + 30);
-  drawPanelBox(boxX, boxY, boxW, boxH);
-  int16_t y = (int16_t)(boxY + 10);
-  for (uint8_t i = 0; i < RESET_N; i++) {
-    bool armed = (i == resetConfirmIdx) && (int32_t)(now - resetConfirmUntil) < 0;
-    drawMenuItem((int16_t)(boxX + 12), y, (int16_t)(boxW - 24), armed ? "really?" : resetItems[i], nullptr,
-                 i == resetSel);
-    y += 30;
-  }
-  drawMenuFooter((int16_t)(boxX + 12), (int16_t)(y + 4), (int16_t)(boxW - 24));
-}
-
 static void drawPasskey() {
   ui().fill(Rect{0, 0, PANEL_TOTAL_W, PANEL_TOTAL_H}, Paint::solid(Color::White));
   int16_t midY = (int16_t)(PANEL_TOTAL_H / 2);
@@ -933,15 +903,11 @@ static void drawPasskey() {
             TextStyle{0, TextAlign::Center, Color::Black, 1, true, false});
 }
 
-static void drawStatusPanel(uint32_t now) {
-  bool passkeyShowing = blePasskey() != 0;
-  overlayOpen = menuOpen || settingsOpen || resetOpen || passkeyShowing;
-
-  if (passkeyShowing) {
-    drawPasskey();
-    return;
-  }
-
+// Everything drawStatusPanel() used to draw MINUS the passkey early-return
+// and the menu/settings/reset overlay drawn on top — those are now their
+// own FreeInkApp screens (screenMenu/screenSettings/screenReset below), and
+// the passkey check now lives in screenMain, which is the only caller.
+static void drawStatusPanelContent(uint32_t now) {
   ui().fill(Rect{PANEL_X, 0, PANEL_W, PANEL_TOTAL_H}, Paint::solid(Color::White));
 
   int16_t y = 12;
@@ -1035,21 +1001,233 @@ static void drawStatusPanel(uint32_t now) {
     snprintf(line, sizeof(line), "Lv %u  tokens %lu", stats().level, (unsigned long)stats().tokens);
     ui().text(Rect{PANEL_X, y, PANEL_W, 20}, line, TextStyle{0, TextAlign::Left, Color::DarkGray, 1, false, false});
   }
+}
 
-  // Overlays draw last, on top of whatever the panel is currently showing —
-  // matches the earlier generation's draw order (menu/settings/reset always
-  // on top of INFO/PET/HUD/clock).
-  if (resetOpen) drawReset(now);
-  else if (settingsOpen) drawSettings();
-  else if (menuOpen) drawMenu();
+// ---------------------------------------------------------------------------
+// FreeInkApp integration.
+//
+// See docs/freeinkapp-migration.md for the full design writeup. Summary:
+//  - One FreeInkApp<UI_MAX_INTERACTIONS, UI_MAX_HANDLERS> instance (gApp)
+//    owns screen transitions (setScreen) and the interaction/handler
+//    tables; screens are plain functions (ScreenFn — see FreeInkApp.h),
+//    not objects, matching the SDK's "no screen stack" model.
+//  - Each pre-migration overlay (menu/settings/reset) becomes its own
+//    full-panel screen rather than a floating box drawn over screenMain —
+//    the one-active-screen model has no "underneath" to composite with, so
+//    threading overlay-open flags through screenMain's draw path would
+//    have fought the framework instead of using it. See "Overlay screens"
+//    in the migration doc for the visual tradeoff this makes.
+//  - BACK is the one button routed through FreeInkApp's real action
+//    dispatch: each screen registers a single full-screen hit with
+//    InputBack, and on() handlers below do what dispatchBack() used to do
+//    inline. CONFIRM/UP/DOWN stay hand-rolled (pollHold() below) because
+//    InputSnapshot has no hold concept for physical buttons, and CONFIRM's
+//    "advance the highlighted item" behavior doesn't fit the SDK's
+//    focus-then-confirm model without auto-focus bookkeeping that would
+//    add complexity for no behavioral gain over calling the handler
+//    directly. LEFT/RIGHT stay hand-rolled too, so a burst of queued
+//    presses in one tick still decrements/increments per press instead of
+//    collapsing to one InputSnapshot edge.
+// ---------------------------------------------------------------------------
+static constexpr size_t UI_MAX_INTERACTIONS = 48;  // headroom over the ~2
+                                                    // hits any single screen
+                                                    // here actually registers
+static constexpr size_t UI_MAX_HANDLERS = 16;      // headroom over the 4
+                                                    // ActionIds below
+using AppType = freeink::ui::FreeInkApp<UI_MAX_INTERACTIONS, UI_MAX_HANDLERS>;
+using ScreenCtx = AppType::ScreenType;
+
+// Constructed lazily in setup() once ui()/uiPtr exists (same reasoning as
+// uiStorage above — FreeInkApp needs a live DrawTarget& at construction).
+alignas(AppType) static unsigned char appStorage[sizeof(AppType)];
+static AppType* gApp = nullptr;
+
+enum AppAction : freeink::ui::ActionId {
+  ACT_MAIN_BACK = 1,
+  ACT_MENU_BACK,
+  ACT_SETTINGS_BACK,
+  ACT_RESET_BACK,
+};
+
+static void screenMain(ScreenCtx& screen, void* user);
+static void screenMenu(ScreenCtx& screen, void* user);
+static void screenSettings(ScreenCtx& screen, void* user);
+static void screenReset(ScreenCtx& screen, void* user);
+static void screenSleep(ScreenCtx& screen, void* user);
+static void screenPowerOff(ScreenCtx& screen, void* user);
+
+// Monochrome theme matching this board's existing look (Color::Black/
+// White/DarkGray only, one font slot for every text role — the bundled
+// DisplayTarget points every font slot at the same bitmap font unless
+// setFont() is called, which this firmware never does). The SDK's own
+// migration doc (docs/freeink-ui.md "Adopting FreeInkUI in an Existing
+// Firmware") suggests sourcing tokens from a JSON ThemeDocument; this
+// project has no JSON config infrastructure and doesn't need one just for
+// this, so the tokens are a plain constexpr-ish literal instead — see
+// docs/freeinkapp-migration.md "Theme tokens".
+static freeink::ui::ThemeTokens buildTheme() {
+  freeink::ui::ThemeTokens t = freeink::ui::defaultThemeTokens(0, 0, 0);
+  t.smallText = TextStyle{0, TextAlign::Left, Color::DarkGray, 1, false, false};
+  t.bodyText = TextStyle{0, TextAlign::Left, Color::Black, 1, false, false};
+  t.titleText = TextStyle{0, TextAlign::Left, Color::Black, 1, true, false};
+  t.rowHeight = 30;  // matches the pre-migration hand-rolled menu row spacing
+  return t;
+}
+
+// Overlay chrome shared by the menu/settings/reset screens: a centered
+// floating box on an otherwise blank page. Pre-migration this box floated
+// over whatever screenMain was showing underneath (the menu could open
+// over the pet, HUD, or clock, which stayed visible around its edges);
+// FreeInkApp's one-screen model has nothing "underneath" once these become
+// their own screens, so the fill() below clears the whole page to white
+// first — see docs/freeinkapp-migration.md "Overlay screens".
+static void drawOverlayBox(uint8_t itemCount, int16_t& boxX, int16_t& boxY, int16_t& boxW, int16_t& boxH) {
+  boxW = 340;
+  boxH = (int16_t)(20 + itemCount * 30 + 30);
+  boxX = (int16_t)((PANEL_TOTAL_W - boxW) / 2);
+  boxY = (int16_t)((PANEL_TOTAL_H - boxH) / 2);
+  ui().fill(Rect{0, 0, PANEL_TOTAL_W, PANEL_TOTAL_H}, Paint::solid(Color::White));
+  ui().fill(Rect{boxX, boxY, boxW, boxH}, Paint::solid(Color::White), 10);
+  ui().stroke(Rect{boxX, boxY, boxW, boxH}, Paint::solid(Color::Black), 2, 10);
+}
+
+static void drawOverlayFooter(int16_t x, int16_t y, int16_t w) {
+  ui().text(Rect{x, y, w, 20}, "CONFIRM: next   BACK: select",
+            TextStyle{0, TextAlign::Left, Color::DarkGray, 1, false, false});
+}
+
+// The base screen: NORMAL/PET/INFO/HUD/clock/prompt/nap are all sub-modes
+// of this ONE FreeInkApp screen (not separate screens) — CONFIRM cycling
+// displayMode never leaves screenMain, so there's no FreeInkApp screen
+// transition involved, just like there wasn't a menuOpen-style flag flip
+// pre-migration either. The passkey pairing screen is handled the same
+// way: a live check of blePasskey() rather than a persistent "screen"
+// state, matching how drawStatusPanel() checked it pre-migration.
+static void screenMain(ScreenCtx& screen, void*) {
+  uint32_t now = millis();
+  if (blePasskey() != 0) {
+    drawPasskey();
+  } else {
+    drawStatusPanelContent(now);
+    RefreshHint spriteHint = napping ? renderNapFrame() : renderSprite(now);
+    if (spriteHint != RefreshHint::None) gApp->invalidate(spriteHint);
+  }
+  // Registered unconditionally (even while the passkey screen is showing),
+  // matching dispatchBack()'s pre-migration behavior of never gating on
+  // passkey display either.
+  screen.frame().hit(screen.frame().screen(), ACT_MAIN_BACK, 0, InputBack);
+}
+
+static void screenMenu(ScreenCtx& screen, void*) {
+  int16_t boxX, boxY, boxW, boxH;
+  drawOverlayBox(MENU_N, boxX, boxY, boxW, boxH);
+
+  ListItem items[MENU_N];
+  for (uint8_t i = 0; i < MENU_N; i++) {
+    items[i] = ListItem{};
+    items[i].label = menuItems[i];
+    items[i].value = (i == 4) ? (dataDemo() ? "on" : "off") : nullptr;
+  }
+  ListProps props;
+  props.items = items;
+  props.count = MENU_N;
+  props.selectedIndex = menuSel;
+  props.action = NO_ACTION;  // visual only — CONFIRM/BACK drive selection
+                              // by hand (see dispatchConfirmTap/menuConfirm),
+                              // not through list()'s own hit registration
+  props.rowHeight = 30;
+  props.labelText = TextStyle{0, TextAlign::Left, Color::Black, 1, false, false};
+  props.valueText = TextStyle{0, TextAlign::Right, Color::DarkGray, 1, false, false};
+  Rect listRect{(int16_t)(boxX + 12), (int16_t)(boxY + 10), (int16_t)(boxW - 24), (int16_t)(MENU_N * 30)};
+  freeink::ui::list(screen.frame(), listRect, props);
+
+  drawOverlayFooter((int16_t)(boxX + 12), (int16_t)(boxY + 10 + MENU_N * 30 + 4), (int16_t)(boxW - 24));
+
+  screen.frame().hit(screen.frame().screen(), ACT_MENU_BACK, 0, InputBack);
+}
+
+static void screenSettings(ScreenCtx& screen, void*) {
+  int16_t boxX, boxY, boxW, boxH;
+  drawOverlayBox(SETTINGS_N, boxX, boxY, boxW, boxH);
+
+  ListItem items[6];  // 6 = SETTINGS_ITEMS_LIGHT's count, the largest of the two lists
+  char valbuf[6][24];
+  Settings& s = settings();
+  for (uint8_t i = 0; i < SETTINGS_N; i++) {
+    items[i] = ListItem{};
+    items[i].label = settingsItems[i];
+    const char* value = nullptr;
+    if (i == 0) value = s.hud ? "on" : "off";
+    else if (i == 1) value = s.flash ? "on" : "off";
+    else if (i == 2) { snprintf(valbuf[i], sizeof(valbuf[i]), "%u/%u", characterIdx + 1, characterCount); value = valbuf[i]; }
+    else if (hasBrightnessItem && i == 3) { snprintf(valbuf[i], sizeof(valbuf[i]), "%u/5", brightLevel + 1); value = valbuf[i]; }
+    items[i].value = value;
+  }
+  ListProps props;
+  props.items = items;
+  props.count = SETTINGS_N;
+  props.selectedIndex = settingsSel;
+  props.action = NO_ACTION;
+  props.rowHeight = 30;
+  props.labelText = TextStyle{0, TextAlign::Left, Color::Black, 1, false, false};
+  props.valueText = TextStyle{0, TextAlign::Right, Color::DarkGray, 1, false, false};
+  Rect listRect{(int16_t)(boxX + 12), (int16_t)(boxY + 10), (int16_t)(boxW - 24), (int16_t)(SETTINGS_N * 30)};
+  freeink::ui::list(screen.frame(), listRect, props);
+
+  drawOverlayFooter((int16_t)(boxX + 12), (int16_t)(boxY + 10 + SETTINGS_N * 30 + 4), (int16_t)(boxW - 24));
+
+  screen.frame().hit(screen.frame().screen(), ACT_SETTINGS_BACK, 0, InputBack);
+}
+
+static void screenReset(ScreenCtx& screen, void*) {
+  uint32_t now = millis();
+  int16_t boxX, boxY, boxW, boxH;
+  drawOverlayBox(RESET_N, boxX, boxY, boxW, boxH);
+
+  ListItem items[RESET_N];
+  for (uint8_t i = 0; i < RESET_N; i++) {
+    items[i] = ListItem{};
+    // Tap-twice confirm: first tap arms (label flips to "really?"), second
+    // within 3s executes — same window as pre-migration applyReset().
+    bool armed = (i == resetConfirmIdx) && (int32_t)(now - resetConfirmUntil) < 0;
+    items[i].label = armed ? "really?" : resetItems[i];
+  }
+  ListProps props;
+  props.items = items;
+  props.count = RESET_N;
+  props.selectedIndex = resetSel;
+  props.action = NO_ACTION;
+  props.rowHeight = 30;
+  props.labelText = TextStyle{0, TextAlign::Left, Color::Black, 1, false, false};
+  Rect listRect{(int16_t)(boxX + 12), (int16_t)(boxY + 10), (int16_t)(boxW - 24), (int16_t)(RESET_N * 30)};
+  freeink::ui::list(screen.frame(), listRect, props);
+
+  drawOverlayFooter((int16_t)(boxX + 12), (int16_t)(boxY + 10 + RESET_N * 30 + 4), (int16_t)(boxW - 24));
+
+  screen.frame().hit(screen.frame().screen(), ACT_RESET_BACK, 0, InputBack);
+}
+
+static void screenSleep(ScreenCtx&, void*) {
+  ui().fill(Rect{0, 0, PANEL_TOTAL_W, PANEL_TOTAL_H}, Paint::solid(Color::White));
+  ui().text(Rect{0, (int16_t)(PANEL_TOTAL_H / 2 - 20), PANEL_TOTAL_W, 40}, "sleeping - press any button",
+            TextStyle{0, TextAlign::Center, Color::DarkGray, 1, false, false});
+}
+
+static void screenPowerOff(ScreenCtx&, void*) {
+  ui().fill(Rect{0, 0, PANEL_TOTAL_W, PANEL_TOTAL_H}, Paint::solid(Color::White));
+  ui().text(Rect{0, (int16_t)(PANEL_TOTAL_H / 2 - 20), PANEL_TOTAL_W, 40}, "powered off - press POWER",
+            TextStyle{0, TextAlign::Center, Color::DarkGray, 1, false, false});
 }
 
 // ---------------------------------------------------------------------------
 // Menu / settings / reset actions — mirrors the earlier generation's
-// menuConfirm()/applySetting()/applyReset().
+// menuConfirm()/applySetting()/applyReset(), now navigating via
+// gApp->setScreen() instead of flipping menuOpen/settingsOpen/resetOpen
+// bools. Called from the BACK action handlers below (real FreeInkApp
+// dispatch) and, for CONFIRM, from dispatchConfirmTap() (hand-rolled —
+// see the FreeInkApp integration comment above for why).
 // ---------------------------------------------------------------------------
 static void powerOffSequence() {
-  ui().fill(Rect{0, 0, PANEL_TOTAL_W, PANEL_TOTAL_H}, Paint::solid(Color::White));
 #if FREEINK_DEVICE_PAPERS3
   // PaperS3 has no POWER GPIO at all (BoardConfig::M5PAPER_S3.input.power is
   // PIN_UNASSIGNED — freeink-sdk/libs/hardware/BoardConfig/include/
@@ -1067,15 +1245,16 @@ static void powerOffSequence() {
   // like PaperMono's board-support call in InputManager.cpp's
   // updateDigitalTwoButton() — is only linked into this device's env; see
   // platformio.ini's [env:papers3].
+  ui().fill(Rect{0, 0, PANEL_TOTAL_W, PANEL_TOTAL_H}, Paint::solid(Color::White));
   ui().text(Rect{0, (int16_t)(PANEL_TOTAL_H / 2 - 20), PANEL_TOTAL_W, 40}, "powering off...",
             TextStyle{0, TextAlign::Center, Color::DarkGray, 1, false, false});
   display.displayBuffer(EInkDisplay::FULL_REFRESH);
   BoardPaperS3::powerOff();  // does not return on battery power
   return;                    // on USB the board can brown back up instead (see powerOff()'s doc comment)
 #else
-  ui().text(Rect{0, (int16_t)(PANEL_TOTAL_H / 2 - 20), PANEL_TOTAL_W, 40}, "powered off - press POWER",
-            TextStyle{0, TextAlign::Center, Color::DarkGray, 1, false, false});
-  display.displayBuffer(EInkDisplay::FULL_REFRESH);
+  gApp->setScreen(screenPowerOff, nullptr, RefreshHint::Full);
+  gApp->render(InputSnapshot{});
+  freeink::ui::present(display, gApp->lastRenderRefreshHint());
   // No PMIC hard-off on this board (the earlier generation's
   // M5.Axp.PowerOff()) — real ESP32 deep sleep, woken by the POWER button,
   // is the equivalent off state. Does not return.
@@ -1085,42 +1264,74 @@ static void powerOffSequence() {
 
 static void menuConfirm() {
   switch (menuSel) {
-    case 0: settingsOpen = true; menuOpen = false; settingsSel = 0; break;
-    case 1: powerOffSequence(); break;
-    case 2: menuOpen = false; displayMode = DISP_INFO; infoPage = INFO_PG_BUTTONS; break;
-    case 3: menuOpen = false; displayMode = DISP_INFO; infoPage = INFO_PG_CREDITS; break;
-    case 4: dataSetDemo(!dataDemo()); break;
-    case 5: menuOpen = false; break;
+    case 0:
+      settingsSel = 0;
+      currentScreen = SCR_SETTINGS;
+      gApp->setScreen(screenSettings, nullptr, RefreshHint::Fast);
+      break;
+    case 1:
+      powerOffSequence();  // does not return
+      break;
+    case 2:
+      displayMode = DISP_INFO;
+      infoPage = INFO_PG_BUTTONS;
+      currentScreen = SCR_MAIN;
+      gApp->setScreen(screenMain, nullptr, RefreshHint::Fast);
+      break;
+    case 3:
+      displayMode = DISP_INFO;
+      infoPage = INFO_PG_CREDITS;
+      currentScreen = SCR_MAIN;
+      gApp->setScreen(screenMain, nullptr, RefreshHint::Fast);
+      break;
+    case 4:
+      dataSetDemo(!dataDemo());  // stays on the menu screen
+      break;
+    case 5:
+      currentScreen = SCR_MAIN;
+      gApp->setScreen(screenMain, nullptr, RefreshHint::Fast);
+      break;
   }
 }
 
 static void applySetting(uint8_t idx) {
   Settings& s = settings();
-  if (hasBrightnessItem) {
-    switch (idx) {
-      case 0: s.hud = !s.hud; break;
-      case 1: s.flash = !s.flash; break;
-      case 2: nextCharacter(); return;
-      case 3: cycleBrightness(); return;
-      case 4: resetOpen = true; resetSel = 0; resetConfirmIdx = 0xFF; return;
-      case 5: settingsOpen = false; return;
-    }
-  } else {
-    switch (idx) {
-      case 0: s.hud = !s.hud; break;
-      case 1: s.flash = !s.flash; break;
-      case 2: nextCharacter(); return;
-      case 3: resetOpen = true; resetSel = 0; resetConfirmIdx = 0xFF; return;
-      case 4: settingsOpen = false; return;
-    }
+  // Collapse the two settings lists (with/without "brightness" — see
+  // hasBrightnessItem above) onto one switch: "brightness" is peeled off
+  // first, then every index past it is shifted down by one so hud/flash/
+  // character/reset/back line up on the same cases regardless of which list
+  // is showing, instead of duplicating the whole switch per list.
+  //
+  // "reset" and "back" both leave the settings screen; back returns to
+  // screenMain directly (not to the menu — settings replaced the menu
+  // outright when it opened, matching menuConfirm() case 0 above, so
+  // there's nothing to return "to" but the base screen).
+  if (hasBrightnessItem && idx == 3) { cycleBrightness(); return; }
+  uint8_t normIdx = (hasBrightnessItem && idx > 3) ? (uint8_t)(idx - 1) : idx;
+  switch (normIdx) {
+    case 0: s.hud = !s.hud; break;
+    case 1: s.flash = !s.flash; break;
+    case 2: nextCharacter(); return;
+    case 3:
+      resetSel = 0;
+      resetConfirmIdx = 0xFF;
+      currentScreen = SCR_RESET;
+      gApp->setScreen(screenReset, nullptr, RefreshHint::Fast);
+      return;
+    case 4:
+      currentScreen = SCR_MAIN;
+      gApp->setScreen(screenMain, nullptr, RefreshHint::Fast);
+      return;
   }
   settingsSave();
 }
 
-// Tap-twice confirm: first tap arms (label flips to "really?"), second
-// within 3s executes.
 static void applyReset(uint8_t idx, uint32_t now) {
-  if (idx == 2) { resetOpen = false; return; }  // back
+  if (idx == 2) {  // back — returns to settings, which stayed "open" underneath
+    currentScreen = SCR_SETTINGS;
+    gApp->setScreen(screenSettings, nullptr, RefreshHint::Fast);
+    return;
+  }
 
   bool armed = (resetConfirmIdx == idx) && (int32_t)(now - resetConfirmUntil) < 0;
   if (!armed) {
@@ -1145,20 +1356,113 @@ static void applyReset(uint8_t idx, uint32_t now) {
     _prefs.end();
     bleClearBonds();
     delay(300);
-    ESP.restart();
+    ESP.restart();  // does not return
   }
-  resetOpen = false;
+  currentScreen = SCR_SETTINGS;
+  gApp->setScreen(screenSettings, nullptr, RefreshHint::Fast);
 }
 
 // ---------------------------------------------------------------------------
-// Screen sleep (POWER button).
+// BACK action handlers — the one button routed through FreeInkApp's real
+// on()/ActionId dispatch (see the FreeInkApp integration comment above).
+// render()'s dispatch already invalidates(Fast) after any of these fires,
+// so unlike the hand-rolled CONFIRM/UP/DOWN paths below, these don't need
+// to call gApp->invalidate() themselves.
 // ---------------------------------------------------------------------------
-static void sleepScreen(uint32_t now) {
+// A pending approval prompt takes priority over whatever screen is open —
+// matches dispatchBack()'s pre-migration priority order (inPrompt checked
+// before resetOpen/settingsOpen/menuOpen/the main screen's own BACK
+// actions). Returns true if it denied a prompt (caller should skip its own
+// screen-specific action in that case).
+static bool denyPendingPromptOnBack() {
+  bool inPrompt = tama.promptId[0] && !responseSent;
+  if (!inPrompt) return false;
+  char cmd[96];
+  snprintf(cmd, sizeof(cmd), "{\"cmd\":\"permission\",\"id\":\"%s\",\"decision\":\"deny\"}", tama.promptId);
+  sendCmd(cmd);
+  responseSent = true;
+  statsOnDenial();
+  return true;
+}
+
+static void onMainBack(const ActionEvent&, void*) {
+  if (denyPendingPromptOnBack()) return;
+  if (displayMode == DISP_INFO) {
+    infoPage = (infoPage + 1) % INFO_PAGES;
+  } else if (displayMode == DISP_PET) {
+    petPage = (petPage + 1) % PET_PAGES;
+  } else {
+    uint8_t maxOffset = tama.nLines > TRANSCRIPT_VISIBLE ? tama.nLines - TRANSCRIPT_VISIBLE : 0;
+    transcriptOffset = (transcriptOffset >= maxOffset) ? 0 : transcriptOffset + 1;
+  }
+}
+
+static void onMenuBack(const ActionEvent&, void*) {
+  if (!denyPendingPromptOnBack()) menuConfirm();
+}
+static void onSettingsBack(const ActionEvent&, void*) {
+  if (!denyPendingPromptOnBack()) applySetting(settingsSel);
+}
+static void onResetBack(const ActionEvent&, void*) {
+  if (!denyPendingPromptOnBack()) applyReset(resetSel, millis());
+}
+
+// ---------------------------------------------------------------------------
+// CONFIRM tap/hold — hand-rolled (see the FreeInkApp integration comment
+// above for why), driven from handleInput()'s pollHold().
+// ---------------------------------------------------------------------------
+static void dispatchConfirmTap(uint32_t now) {
+  bool inPrompt = tama.promptId[0] && !responseSent;
+  if (inPrompt) {
+    char cmd[96];
+    snprintf(cmd, sizeof(cmd), "{\"cmd\":\"permission\",\"id\":\"%s\",\"decision\":\"once\"}", tama.promptId);
+    sendCmd(cmd);
+    responseSent = true;
+    uint32_t tookS = (now - promptArrivedMs) / 1000;
+    statsOnApproval(tookS);
+    if (tookS < 5) triggerOneShot(P_HEART, 2000);
+  } else if (currentScreen == SCR_RESET) {
+    resetSel = (resetSel + 1) % RESET_N;
+    resetConfirmIdx = 0xFF;
+  } else if (currentScreen == SCR_SETTINGS) {
+    settingsSel = (settingsSel + 1) % SETTINGS_N;
+  } else if (currentScreen == SCR_MENU) {
+    menuSel = (menuSel + 1) % MENU_N;
+  } else {
+    displayMode = (DisplayMode)((displayMode + 1) % DISP_COUNT);
+  }
+  gApp->invalidate(RefreshHint::Fast);
+}
+
+static void dispatchConfirmHold() {
+  if (currentScreen == SCR_RESET) {
+    currentScreen = SCR_SETTINGS;
+    gApp->setScreen(screenSettings, nullptr, RefreshHint::Fast);
+  } else if (currentScreen == SCR_SETTINGS) {
+    currentScreen = SCR_MAIN;
+    gApp->setScreen(screenMain, nullptr, RefreshHint::Fast);
+  } else if (currentScreen == SCR_MENU) {
+    currentScreen = SCR_MAIN;
+    gApp->setScreen(screenMain, nullptr, RefreshHint::Fast);
+  } else {
+    menuSel = 0;
+    currentScreen = SCR_MENU;
+    gApp->setScreen(screenMenu, nullptr, RefreshHint::Fast);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Screen sleep (POWER button) — hand-rolled, entirely outside FreeInkApp's
+// render()/route() loop: while asleep, loop() never calls gApp->render()
+// at all (see loop() below), matching the pre-migration build never
+// calling drawStatusPanel()/renderSprite() while screenAwake was false.
+// ---------------------------------------------------------------------------
+static void enterSleepScreen(uint32_t now) {
   screenAwake = false;
-  ui().fill(Rect{0, 0, PANEL_TOTAL_W, PANEL_TOTAL_H}, Paint::solid(Color::White));
-  ui().text(Rect{0, (int16_t)(PANEL_TOTAL_H / 2 - 20), PANEL_TOTAL_W, 40}, "sleeping - press any button",
-            TextStyle{0, TextAlign::Center, Color::DarkGray, 1, false, false});
-  display.displayBuffer(EInkDisplay::FULL_REFRESH);
+  currentScreen = SCR_SLEEP;
+  gApp->setScreen(screenSleep, nullptr, RefreshHint::Full);
+  gApp->render(InputSnapshot{});
+  freeink::ui::present(display, gApp->lastRenderRefreshHint());
   lastFullRefreshMs = now;
 }
 
@@ -1167,9 +1471,10 @@ static void wakeScreen(uint32_t now) {
   stateEnteredMs = now;
   sleepFrameDrawn = false;
   lastSpriteDrawMs = 0;
-  drawStatusPanel(now);
-  renderSprite(now);
-  display.displayBuffer(EInkDisplay::FULL_REFRESH);
+  currentScreen = SCR_MAIN;
+  gApp->setScreen(screenMain, nullptr, RefreshHint::Full);
+  gApp->render(InputSnapshot{});
+  freeink::ui::present(display, gApp->lastRenderRefreshHint());
   lastFullRefreshMs = now;
 }
 
@@ -1214,7 +1519,11 @@ static void toggleNap(uint32_t now) {
 //   DOWN           hold (~800ms): trigger "dizzy" — substitute for shake
 //                  (BoardConfig::XTEINK_X4 has NO_SENSORS; confirmed via
 //                  BoardConfig, not assumed)
-//   POWER          toggle screen sleep — sleepScreen()/wakeScreen() above
+//   POWER          toggle screen sleep — enterSleepScreen()/wakeScreen() above
+//
+// Only BACK is fed into gSnapshot and routed through FreeInkApp's real
+// dispatch (gApp->render() below); CONFIRM/UP/DOWN/LEFT/RIGHT/POWER stay
+// hand-rolled here — see the FreeInkApp integration comment above for why.
 // ---------------------------------------------------------------------------
 struct HoldButton {
   uint32_t pressStart = 0;
@@ -1234,60 +1543,10 @@ static uint8_t pollHold(HoldButton& hb, bool down, uint32_t now, uint32_t holdMs
 
 static HoldButton confirmHold, upHold, downHold;
 
-static void dispatchConfirmHold() {
-  if (resetOpen) resetOpen = false;
-  else if (settingsOpen) settingsOpen = false;
-  else { menuOpen = !menuOpen; menuSel = 0; }
-  needsRedraw = true;
-}
-
-static void dispatchConfirmTap(uint32_t now) {
-  bool inPrompt = tama.promptId[0] && !responseSent;
-  if (inPrompt) {
-    char cmd[96];
-    snprintf(cmd, sizeof(cmd), "{\"cmd\":\"permission\",\"id\":\"%s\",\"decision\":\"once\"}", tama.promptId);
-    sendCmd(cmd);
-    responseSent = true;
-    uint32_t tookS = (now - promptArrivedMs) / 1000;
-    statsOnApproval(tookS);
-    if (tookS < 5) triggerOneShot(P_HEART, 2000);
-  } else if (resetOpen) {
-    resetSel = (resetSel + 1) % RESET_N;
-    resetConfirmIdx = 0xFF;
-  } else if (settingsOpen) {
-    settingsSel = (settingsSel + 1) % SETTINGS_N;
-  } else if (menuOpen) {
-    menuSel = (menuSel + 1) % MENU_N;
-  } else {
-    displayMode = (DisplayMode)((displayMode + 1) % DISP_COUNT);
-  }
-  needsRedraw = true;
-}
-
-static void dispatchBack(uint32_t now) {
-  bool inPrompt = tama.promptId[0] && !responseSent;
-  if (inPrompt) {
-    char cmd[96];
-    snprintf(cmd, sizeof(cmd), "{\"cmd\":\"permission\",\"id\":\"%s\",\"decision\":\"deny\"}", tama.promptId);
-    sendCmd(cmd);
-    responseSent = true;
-    statsOnDenial();
-  } else if (resetOpen) {
-    applyReset(resetSel, now);
-  } else if (settingsOpen) {
-    applySetting(settingsSel);
-  } else if (menuOpen) {
-    menuConfirm();
-  } else if (displayMode == DISP_INFO) {
-    infoPage = (infoPage + 1) % INFO_PAGES;
-  } else if (displayMode == DISP_PET) {
-    petPage = (petPage + 1) % PET_PAGES;
-  } else {
-    uint8_t maxOffset = tama.nLines > TRANSCRIPT_VISIBLE ? tama.nLines - TRANSCRIPT_VISIBLE : 0;
-    transcriptOffset = (transcriptOffset >= maxOffset) ? 0 : transcriptOffset + 1;
-  }
-  needsRedraw = true;
-}
+// Rebuilt every tick by handleInput(), consumed once by gApp->render() in
+// loop(). Edge-only (a tap sets it true for exactly the tick it happened
+// in), matching InputSnapshot's own edge-triggered field convention.
+static InputSnapshot gSnapshot;
 
 // =============================================================================
 // PaperS3 touch-only navigation — SELF-CONTAINED BLOCK, start.
@@ -1414,7 +1673,11 @@ static void handleTouchNav(uint32_t now) {
   // rationale popPress() gives every button board.
   while (input.popTouchTap(nx, ny)) {
     if (nx < TOUCH_BACK_ZONE_NX && ny > 1.0f - TOUCH_BACK_ZONE_NY) {
-      dispatchBack(now);
+      // dispatchBack() was removed by the FreeInkApp migration — BACK now
+      // routes through gSnapshot/FreeInkApp's ActionId::InputBack instead
+      // (see the "BACK: fed into gSnapshot" comment in handleInput() below).
+      // PaperS3's touch-only BACK zone feeds the same mechanism.
+      gSnapshot.back = true;
     } else {
       dispatchConfirmTap(now);
     }
@@ -1425,16 +1688,17 @@ static void handleTouchNav(uint32_t now) {
 
 // InputManager runs on a background FreeRTOS task (input.beginAsync() in
 // setup()), not on our own polling here — required because
-// display.displayWindow()/displayBuffer() block the main loop for
-// anywhere from ~50ms (a small partial) to ~2s (a full refresh, per
-// FreeInkDisplay's own docs), and a press-and-release that happens
-// entirely inside one of those blocking calls would otherwise never be
-// seen. The async task calls update() itself, so isPressed() (a plain
-// level read of the task's currentState) is still safe to read from here
-// — see InputManager.cpp's asyncPoll(). Only wasPressed()/update() are
-// unsafe to call ourselves once async polling owns the edge state; edges
-// come from popPress().
+// freeink::ui::present() blocks the main loop for anywhere from ~50ms (a
+// fast refresh) to ~2s (a full refresh, per FreeInkDisplay's own docs), and
+// a press-and-release that happens entirely inside one of those blocking
+// calls would otherwise never be seen. The async task calls update() itself,
+// so isPressed() (a plain level read of the task's currentState) is still
+// safe to read from here — see InputManager.cpp's asyncPoll(). Only
+// wasPressed()/update() are unsafe to call ourselves once async polling owns
+// the edge state; edges come from popPress().
 static void handleInput(uint32_t now) {
+  gSnapshot = InputSnapshot{};
+
   if (!screenAwake) {
     // Any press just wakes the screen — never doubles as that button's
     // normal action, so a CONFIRM that wakes the device can't also
@@ -1464,11 +1728,12 @@ static void handleInput(uint32_t now) {
   }
 
   // Real shake, on boards with an IMU (see checkShake() above). Gated on
-  // !overlayOpen/!napping to match the earlier M5-era generation's own
-  // !menuOpen/!screenOff gate — a shake mid-menu-navigation or mid-nap
-  // shouldn't interrupt either.
+  // "not on an overlay screen and not napping" to match the earlier
+  // M5-era generation's own !menuOpen/!screenOff gate — a shake mid-menu-
+  // navigation or mid-nap shouldn't interrupt either.
   static uint32_t lastShakeCheckMs = 0;
-  if (imuAvailable && !overlayOpen && !napping && now - lastShakeCheckMs > 50) {
+  bool overlayOrNap = (currentScreen != SCR_MAIN) || napping;
+  if (imuAvailable && !overlayOrNap && now - lastShakeCheckMs > 50) {
     lastShakeCheckMs = now;
     if (checkShake() && (int32_t)(now - oneShotUntil) >= 0) {
       triggerOneShot(P_DIZZY, 2000);
@@ -1480,15 +1745,20 @@ static void handleInput(uint32_t now) {
   // board — GT911 only ever sets BTN_CONFIRM when synthesizeConfirm is true,
   // which PaperS3's profile leaves false — but returning here keeps this
   // board's actual dispatch path in the one clearly-marked block above it).
-  // See "PaperS3 touch-only navigation" above for the full zone layout.
+  // See "PaperS3 touch-only navigation" above for the full zone layout. This
+  // predates the FreeInkApp migration below and is unaffected by it — PaperS3
+  // never reaches gSnapshot/FreeInkApp routing at all.
   if (touchOnlyNavActive()) {
     handleTouchNav(now);
     return;
   }
 
-  // BACK/LEFT/RIGHT/POWER: plain press-edge actions, no hold behavior.
-  // CONFIRM/UP/DOWN edges are drained here too (silently — they're handled
-  // below via level-polling so tap and hold can be told apart).
+  // BACK: fed into gSnapshot below, routed through FreeInkApp. LEFT/RIGHT/
+  // POWER: plain press-edge actions, handled directly here (see the
+  // FreeInkApp integration comment above for why LEFT/RIGHT aren't routed
+  // through an ActionId too). CONFIRM/UP/DOWN edges are drained here too
+  // (silently — they're handled below via level-polling so tap and hold
+  // can be told apart).
   //
   // X4 Pro has no physical BACK — its profile's input.back is PIN_UNASSIGNED
   // (confirmed via BoardConfig; see README "Multi-board support"), and
@@ -1499,22 +1769,26 @@ static void handleInput(uint32_t now) {
   // (X4 Pro's own input.left/right are PIN_UNASSIGNED too — its two
   // physical nav buttons wire to the semantic UP/DOWN slots instead, per
   // its BoardConfig profile), so a Home-key tap is the only way BACK
-  // happens on this board; wire it to the same dispatchBack() every other
-  // board's physical BACK button calls. Inert (returns false) on boards
+  // happens on this board; it feeds the same gSnapshot.back every other
+  // board's physical BACK button sets. Inert (returns false) on boards
   // without touch.
-  if (input.wasHomeKeyTapped()) dispatchBack(now);
+  bool backEdge = input.wasHomeKeyTapped();
 
   uint8_t btn;
   while (input.popPress(btn)) {
     if (btn == InputManager::BTN_BACK) {
-      dispatchBack(now);
+      backEdge = true;
     } else if (btn == InputManager::BTN_LEFT) {
-      if (transcriptOffset > 0) transcriptOffset--;
-      needsRedraw = true;
+      if (currentScreen == SCR_MAIN) {
+        if (transcriptOffset > 0) transcriptOffset--;
+        gApp->invalidate(RefreshHint::Fast);
+      }
     } else if (btn == InputManager::BTN_RIGHT) {
-      uint8_t maxOffset = tama.nLines > TRANSCRIPT_VISIBLE ? tama.nLines - TRANSCRIPT_VISIBLE : 0;
-      if (transcriptOffset < maxOffset) transcriptOffset++;
-      needsRedraw = true;
+      if (currentScreen == SCR_MAIN) {
+        uint8_t maxOffset = tama.nLines > TRANSCRIPT_VISIBLE ? tama.nLines - TRANSCRIPT_VISIBLE : 0;
+        if (transcriptOffset < maxOffset) transcriptOffset++;
+        gApp->invalidate(RefreshHint::Fast);
+      }
     } else if (btn == InputManager::BTN_POWER) {
       // InputStyle::DigitalFiveKey (Murphy M3) has no tap/hold disambiguation
       // for a shared confirm/power pin the way DigitalConfirmPowerHold (e.g.
@@ -1530,10 +1804,11 @@ static void handleInput(uint32_t now) {
           BoardConfig::ACTIVE.input.power == BoardConfig::ACTIVE.input.confirm) {
         continue;
       }
-      sleepScreen(now);
+      enterSleepScreen(now);
       return;  // screen is asleep now; the rest of this batch no longer applies
     }
   }
+  gSnapshot.back = backEdge;
 
   uint8_t r;
   r = pollHold(confirmHold, input.isPressed(InputManager::BTN_CONFIRM), now, 600);
@@ -1542,11 +1817,10 @@ static void handleInput(uint32_t now) {
 
   r = pollHold(upHold, input.isPressed(InputManager::BTN_UP), now, 800);
   if (r == 1) {
-    display.displayBuffer(EInkDisplay::FULL_REFRESH);
-    lastFullRefreshMs = now;
+    gApp->invalidate(RefreshHint::Full);
   } else if (r == 2) {
     toggleNap(now);
-    needsRedraw = true;
+    gApp->invalidate(RefreshHint::Fast);
   }
 
   r = pollHold(downHold, input.isPressed(InputManager::BTN_DOWN), now, 800);
@@ -1683,6 +1957,17 @@ void setup() {
   snprintf(btName, sizeof(btName), "Claude-%02X%02X", mac[4], mac[5]);
   bleInit(btName);
 
+  // FreeInkApp: theme + action handlers + the initial screen. See the
+  // "FreeInkApp integration" comment above for the overall design.
+  gApp = new (appStorage) AppType(ui(), uiPtr->deviceContext(), nullptr);
+  gApp->setTheme(buildTheme());
+  gApp->on(ACT_MAIN_BACK, onMainBack);
+  gApp->on(ACT_MENU_BACK, onMenuBack);
+  gApp->on(ACT_SETTINGS_BACK, onSettingsBack);
+  gApp->on(ACT_RESET_BACK, onResetBack);
+  currentScreen = SCR_MAIN;
+  gApp->setScreen(screenMain, nullptr, RefreshHint::Full);
+
   stateEnteredMs = millis();
 }
 
@@ -1731,14 +2016,10 @@ void loop() {
     return;
   }
 
-  // Panel drawn first: renderSprite() can trigger a FULL_REFRESH (celebrate),
-  // which pushes the whole framebuffer — the panel text must already be
-  // current in it when that happens, not from a stale previous tick.
-  drawStatusPanel(now);
-  if (napping) renderNapFrame();
-  else renderSprite(now);
-
-  // Mandatory DC-balance full refresh, independent of activity/state.
+  // Mandatory DC-balance full refresh, independent of activity/state — see
+  // FULL_REFRESH_INTERVAL_MS above. gApp->invalidate() only ever upgrades
+  // the pending RefreshHint (see FreeInkApp::invalidate()), so this can't
+  // downgrade a Full a screen transition already queued this tick.
   if (now - lastFullRefreshMs > FULL_REFRESH_INTERVAL_MS) {
     // On PaperColor a plain FULL_REFRESH is interrupted at ~340ms and does NOT
     // DC-balance the panel (freeink-sdk/README.md "M5Stack PaperColor refresh
@@ -1754,25 +2035,41 @@ void loop() {
       display.requestCompleteWaveformNextRefresh();
       lastCompleteWaveformMs = now;
     }
-    display.displayBuffer(EInkDisplay::FULL_REFRESH);
-    lastFullRefreshMs = now;
-    needsRedraw = false;
-  } else if (activeState != P_CELEBRATE) {
-    // The status panel is drawn every tick above but only pushed to the
-    // panel when something in it can plausibly have changed, to avoid
-    // hammering the (still-visible) partial-refresh region with redundant
-    // waveforms — except when an input action set needsRedraw, which
-    // bypasses the throttle so menu navigation feels immediate. Overlays
-    // (menu/settings/reset/passkey) span the sprite region too, so they
-    // get the full 800x480 window instead of just the panel's rect.
-    static uint32_t lastPanelDrawMs = 0;
-    bool due = needsRedraw || (now - lastPanelDrawMs > 1000);
-    if (due) {
-      if (overlayOpen) display.displayWindow(0, 0, PANEL_TOTAL_W, PANEL_TOTAL_H);
-      else display.displayWindow(PANEL_X, 0, PANEL_TOTAL_W - PANEL_X, PANEL_TOTAL_H);
-      lastPanelDrawMs = now;
-      needsRedraw = false;
-    }
+    gApp->invalidate(RefreshHint::Full);
+  }
+
+  // Panel-content throttle: screenMain redraws HUD/pet/info/clock text into
+  // the framebuffer every tick regardless (cheap — plain text draws), but a
+  // panel PUSH is only requested on this cadence, to avoid hammering the
+  // panel with redundant waveforms — matches the pre-migration "needsRedraw
+  // || interval elapsed" gate; menu/settings/reset navigation already gets
+  // its own immediate invalidate from dispatchConfirmTap()/render()'s
+  // post-dispatch invalidate(Fast), so this only needs to cover screenMain's
+  // otherwise-idle content (a growing "approve? Ns" counter, an updated
+  // clock, new transcript lines).
+  static uint32_t lastPanelInvalidateMs = 0;
+  if (currentScreen == SCR_MAIN && now - lastPanelInvalidateMs > 1000) {
+    gApp->invalidate(RefreshHint::Fast);
+    lastPanelInvalidateMs = now;
+  }
+
+  gApp->render(gSnapshot);
+
+  static bool loggedUiOverflow = false;
+  if (!loggedUiOverflow && (gApp->interactionOverflowed() || gApp->handlerOverflowed())) {
+    // Should never happen at UI_MAX_INTERACTIONS=48/UI_MAX_HANDLERS=16 given
+    // what's actually registered today (see the FreeInkApp integration
+    // comment above) — logged once, loudly, instead of silently dropping
+    // interactions/handlers, so a future screen addition that overflows the
+    // table gets noticed instead of just "acting weird".
+    Serial.println("[ui] FreeInkApp interaction/handler table overflowed");
+    loggedUiOverflow = true;
+  }
+
+  RefreshHint hint = gApp->lastRenderRefreshHint();
+  if (hint != RefreshHint::None) {
+    freeink::ui::present(display, hint);
+    if (hint == RefreshHint::Full) lastFullRefreshMs = now;
   }
 
   delay(16);

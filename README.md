@@ -118,8 +118,10 @@ level without duplicating logic:
   capacitive Home key is its own separate API
   (`wasHomeKeyTapped()`/`wasHomeKeyPressed()`), not part of the `BTN_*`
   system `popPress()` drains, so `handleInput()` calls it explicitly and
-  routes a tap to the same `dispatchBack()` every other board's physical
-  `BACK` button calls. `LEFT`/`RIGHT` have no physical or synthesized path
+  feeds it into the same `InputSnapshot.back` edge every other board's
+  physical `BACK` button sets (see "Menu system" and
+  `docs/freeinkapp-migration.md` for how that edge gets routed to a
+  screen's BACK handler). `LEFT`/`RIGHT` have no physical or synthesized path
   on this board at all; transcript scrolling still works via `BACK`'s
   "next page" behavior (see "Controls"), just without the fine-grained
   back-and-forth `LEFT`/`RIGHT` gives on X4/X3.
@@ -228,11 +230,11 @@ directional pair. `POWER` and `CONFIRM`-hold-for-menu work the same as
 X4/X3.
 
 **Input polling is async, not synchronous with the render loop.**
-`display.displayWindow()`/`displayBuffer()` block the main loop for
-anywhere from ~50ms (a small partial refresh) to ~2s (a full refresh) — a
-CONFIRM/BACK press-and-release landing entirely inside one of those calls
-would be silently dropped by a synchronous `input.update()`/`wasPressed()`
-loop. `setup()` calls `input.beginAsync()` (spawns `InputManager`'s own
+`freeink::ui::present()` (the FreeInkApp-era wrapper around
+`display.displayBuffer()`) blocks the main loop for anywhere from ~50ms (a
+fast partial refresh) to ~2s (a full refresh) — a CONFIRM/BACK
+press-and-release landing entirely inside one of those calls would be
+silently dropped by a synchronous `input.update()`/`wasPressed()` loop. `setup()` calls `input.beginAsync()` (spawns `InputManager`'s own
 FreeRTOS polling task) and `handleInput()` drains edges via `popPress()`
 instead — the same pattern Free-Ink's inkdeck uses for this exact reason.
 `isPressed()` (a plain level read, used for the `DOWN` long-press timer
@@ -256,11 +258,16 @@ task owns the edge state.
 ## Menu system
 
 The status panel has three screens (`CONFIRM` tap cycles through them),
-plus a menu/settings/reset overlay stack on top — the same structure the
-earlier M5-based generation used, adapted to this board's buttons and
-single fixed panel (there's no "peek" scaling: the pet sprite keeps
-animating in its own region regardless of which screen is showing beside
-it).
+plus menu/settings/reset screens reachable from it via `CONFIRM`-hold — the
+same navigation structure the earlier M5-based generation used, adapted to
+this board's buttons and single fixed panel (there's no "peek" scaling: the
+pet sprite keeps animating in its own region regardless of which screen is
+showing beside it). Screens are built on the FreeInk SDK's `FreeInkApp`
+runtime rather than a hand-rolled overlay-flag state machine (see
+`docs/freeinkapp-migration.md`); menu/settings/reset each replace the whole
+panel while open rather than floating over the screen underneath — a
+deliberate tradeoff of that migration, see the doc's "Overlay screens"
+section.
 
 - **home** — session counts, the latest message, and a scrollable
   transcript (`LEFT`/`RIGHT`), or the approval prompt when one's pending.
@@ -339,15 +346,21 @@ X4/X4 Pro, 792×528 on X3); everything panel-relative around it
 size from `display.getDisplayWidth()`/`getDisplayHeight()` at boot instead
 of assuming 800×480 — see "Multi-board support".
 
+Each state's `renderSprite()` case redraws the sprite region on its own
+cadence and reports a `RefreshHint` (`Fast` for a partial refresh, `Full`
+for a whole-panel one); `screenMain()` forwards that to `gApp->invalidate()`,
+and `loop()` pushes it to the panel once via `freeink::ui::present()` — see
+`docs/freeinkapp-migration.md`. The cadence and refresh strength per state:
+
 | State | What runs | Why |
 |---|---|---|
 | `sleep` | Draw once on entry, then nothing until the state changes | static frame, no refresh loop |
-| `idle` | `displayWindow()` on the sprite region, ~1.5s cadence | slow partial refresh reads as a charming blink, not lag |
-| `busy` | `displayWindow()`, ~350ms cadence | fast partial, but still windowed — never touches the panel outside the sprite region |
-| `attention` | `displayWindow()` at ~400ms, alternating the icon with a bit-inverted copy of the same region (manual XOR over the framebuffer bytes) | no LED on this board — this reads as urgent, distinct from idle's slower blink |
-| `celebrate` | Cycles the clip's frames, one `FULL_REFRESH` (whole panel) each | infrequent (every 50K tokens) — can afford the cost; also resets the DC-balance timer below |
-| `dizzy` | `displayWindow()`, ~200ms cadence, one-shot ~2s | short-lived, triggered by a `DOWN` long-press |
-| `heart` | `displayWindow()`, ~250ms cadence, one-shot ~2s | similar budget to celebrate but partial, not full — it fires on every fast approval, far more often |
+| `idle` | Fast (partial) refresh over the sprite region, ~1.5s cadence | slow partial refresh reads as a charming blink, not lag |
+| `busy` | Fast refresh, ~350ms cadence | fast partial, but still windowed — never touches the panel outside the sprite region |
+| `attention` | Fast refresh at ~400ms, alternating the icon with a bit-inverted copy of the same region (manual XOR over the framebuffer bytes) | no LED on this board — this reads as urgent, distinct from idle's slower blink |
+| `celebrate` | Cycles the clip's frames, one Full (whole-panel) refresh each | infrequent (every 50K tokens) — can afford the cost; also resets the DC-balance timer below |
+| `dizzy` | Fast refresh, ~200ms cadence, one-shot ~2s | short-lived, triggered by a `DOWN` long-press |
+| `heart` | Fast refresh, ~250ms cadence, one-shot ~2s | similar budget to celebrate but partial, not full — it fires on every fast approval, far more often |
 
 **Mandatory full-refresh timer**, independent of the table above:
 `FULL_REFRESH_INTERVAL_MS` (`main.cpp`, currently 5 minutes) forces a
