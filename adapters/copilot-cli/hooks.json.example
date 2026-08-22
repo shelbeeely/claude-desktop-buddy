@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "type": "command",
+        "bash": "node /ABSOLUTE/PATH/TO/claude-desktop-buddy/adapters/copilot-cli/hooks/session-start.js",
+        "timeoutSec": 5
+      }
+    ],
+    "preToolUse": [
+      {
+        "type": "command",
+        "bash": "node /ABSOLUTE/PATH/TO/claude-desktop-buddy/adapters/copilot-cli/hooks/pre-tool-use.js",
+        "matcher": "shell|write",
+        "timeoutSec": 30
+      }
+    ],
+    "postToolUse": [
+      {
+        "type": "command",
+        "bash": "node /ABSOLUTE/PATH/TO/claude-desktop-buddy/adapters/copilot-cli/hooks/post-tool-use.js",
+        "timeoutSec": 5
+      }
+    ]
+  }
+}

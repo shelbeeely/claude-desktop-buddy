@@ -193,6 +193,16 @@ If discovery isn't finding the device:
 - Make sure it's awake (any button press)
 - Check that it hasn't been power-cycled off since its last pairing
 
+## Beyond Claude
+
+The wire protocol (see REFERENCE.md) doesn't care which app is on the
+other end — Claude's desktop apps are just the reference sender this
+device shipped pairing with. **[adapters/](adapters/)** has ready-made
+bridges for GitHub Copilot CLI, OpenAI Codex CLI, and Aider (plus a
+template for wiring up anything else) over USB serial, so the same
+firmware can show activity from — and, for tools with a permission hook,
+forward approval prompts from — other AI coding tools too.
+
 ## Controls
 
 This firmware aims to match the earlier M5StickCPlus-based desktop-buddy's

@@ -1,0 +1,30 @@
+# Snippet for ~/.codex/config.toml (or <repo>/.codex/config.toml) — merge
+# into your existing config rather than replacing it wholesale. Replace
+# /ABSOLUTE/PATH/TO/claude-desktop-buddy with this repo's real path.
+#
+# The exact hook-timeout key name/units weren't pinned down from the docs
+# consulted while writing this — check `codex --help` or
+# https://learn.chatgpt.com/docs/hooks for your installed version if you
+# want to tune it; pre-tool-use.js's own 25s internal timeout already
+# keeps it well-behaved without one.
+
+[[hooks.PreToolUse]]
+# Only tool calls matching this regex get forwarded to the device for a
+# physical approve/deny — see ../README.md before widening this. Tool
+# names are Codex's canonical ones ("Bash", "apply_patch", or an MCP tool
+# name) — check yours before relying on this pattern.
+matcher = "^(Bash|apply_patch)$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "node /ABSOLUTE/PATH/TO/claude-desktop-buddy/adapters/codex-cli/hooks/pre-tool-use.js"
+
+[[hooks.PostToolUse]]
+matcher = ".*"
+
+[[hooks.PostToolUse.hooks]]
+type = "command"
+command = "node /ABSOLUTE/PATH/TO/claude-desktop-buddy/adapters/codex-cli/hooks/post-tool-use.js"
+
+# Fires once per completed turn (not per tool call) — see hooks/notify.js.
+notify = ["node", "/ABSOLUTE/PATH/TO/claude-desktop-buddy/adapters/codex-cli/hooks/notify.js"]

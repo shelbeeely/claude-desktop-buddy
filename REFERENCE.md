@@ -5,6 +5,12 @@ You don't need anything from this repository to implement it. Any device
 that can advertise the Nordic UART Service and parse newline-delimited JSON
 will work: Arduino, ESP32, nRF52, a Raspberry Pi with a BLE dongle.
 
+Nothing here is Claude-specific either, on the *sending* side: this repo's
+[`adapters/`](adapters/) directory has host-side scripts that speak this
+same protocol on behalf of other AI coding tools (GitHub Copilot CLI,
+OpenAI Codex CLI, Aider), sent over plain USB serial instead of BLE — see
+`adapters/TEMPLATE.md` if you want to bridge something else.
+
 ## Enabling the bridge
 
 The BLE bridge is off by default. In Claude for macOS or Windows:
@@ -28,9 +34,14 @@ window open for initial pairing, the stats panel, or the folder drop target.
 | RX (desktop → device, write)  | `6e400002-b5a3-f393-e0a9-e50e24dcca9e` |
 | TX (device → desktop, notify) | `6e400003-b5a3-f393-e0a9-e50e24dcca9e` |
 
-Advertise a name starting with `Claude` over the Nordic UART Service so the
-device picker can filter to you. Appending a few bytes of your BT MAC keeps
-multiple devices distinguishable in the picker.
+Advertise a name starting with `Claude` over the Nordic UART Service so
+Claude's own device picker can filter to you — that naming requirement is
+specific to being discovered by Claude's desktop apps, not part of the JSON
+protocol itself. This repository's own firmware also accepts the identical
+JSON over **plain USB serial at 115200 baud**, no BLE stack or pairing
+involved (`src/data.h`'s parser reads both the same way) — that's what
+every script in `adapters/` uses, since it's simpler for a host-side
+bridge running on the same machine as the device.
 
 Everything on the wire is UTF-8 JSON—one object per line, terminated with
 `\n`. The desktop reassembles multi-packet lines on its end (notifications

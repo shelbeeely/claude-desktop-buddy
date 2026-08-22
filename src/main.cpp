@@ -802,7 +802,7 @@ static int16_t drawInfoPage(uint32_t now, int16_t y) {
   char b[64];
 
   if (infoPage == 0) {
-    ln(Color::DarkGray, "I watch your Claude desktop");
+    ln(Color::DarkGray, "I watch your AI coding");
     ln(Color::DarkGray, "sessions. I sleep when");
     ln(Color::DarkGray, "nothing's happening, wake");
     ln(Color::DarkGray, "when you start working, get");

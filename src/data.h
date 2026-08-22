@@ -25,7 +25,7 @@ struct TamaState {
 // Three modes, checked in priority order:
 //   demo   → auto-cycle fake scenarios every 8s, ignore live data
 //   live   → JSON arrived in the last 10s over USB or BT
-//   asleep → no data, all zeros, "No Claude connected"
+//   asleep → no data, all zeros, "No session connected"
 // ---------------------------------------------------------------------------
 
 static uint32_t _lastLiveMs = 0;
@@ -179,7 +179,10 @@ inline void dataPoll(TamaState* out) {
   if (!out->connected) {
     out->sessionsTotal=0; out->sessionsRunning=0; out->sessionsWaiting=0;
     out->recentlyCompleted=false; out->lastUpdated=now;
-    strncpy(out->msg, "No Claude connected", sizeof(out->msg)-1);
+    // The wire protocol (REFERENCE.md) doesn't identify which app is on the
+    // other end — Claude's desktop apps and any adapter in adapters/ all
+    // speak the same JSON, so this can't claim it's specifically Claude.
+    strncpy(out->msg, "No session connected", sizeof(out->msg)-1);
     out->msg[sizeof(out->msg)-1]=0;
   }
 }
