@@ -1,5 +1,5 @@
 // claude-desktop-buddy — Xteink firmware (X4, X3, X4 Pro, Murphy M3, PaperS3,
-// LilyGo T5 S3, M5 PaperColor, de-link, Sticky).
+// LilyGo T5 S3, M5 PaperColor, de-link, Sticky, M5Stack Paper Mono).
 //
 // Nordic UART Service BLE bridge (ble_bridge.cpp/h) + JSON wire protocol
 // (data.h, xfer.h) + NVS-backed stats/owner/settings (stats.h) driving a
@@ -10,17 +10,18 @@
 // settings menu cycle between them — see README.md "SD-backed character
 // packs" and "Menu system".
 //
-// This one file drives nine boards, two of which (X4, X3) share one
+// This one file drives ten boards, two of which (X4, X3) share one
 // ESP32-C3 binary (env:xteink) picked at runtime by freeink::
 // selectXteinkDevice() in setup(); the rest (X4 Pro, Murphy M3, M5Stack
-// PaperS3, LilyGo T5 S3, M5 PaperColor, de-link, Sticky) are each their own
-// ESP32-S3 binary (env:xteink_x4pro, env:murphy, env:papers3,
-// env:lilygo_t5s3, env:papercolor, env:delink, env:sticky) but run the same
-// source. Sticky is UNVERIFIED — freeink-sdk marks it an "Upcoming Device"
-// with no hardware validation; see docs/board-notes/sticky.md. Where a
-// board has real hardware the M5-era original also had (X3's IMU/RTC/
-// battery gauge, X4 Pro's touch/frontlight/RTC/gauge, PaperS3's touch/RTC,
-// Sticky's RTC/IMU/gauge), this file uses it via
+// PaperS3, LilyGo T5 S3, M5 PaperColor, de-link, Sticky, M5Stack Paper
+// Mono) are each their own ESP32-S3 binary (env:xteink_x4pro, env:murphy,
+// env:papers3, env:lilygo_t5s3, env:papercolor, env:delink, env:sticky,
+// env:papermono) but run the same source. Sticky is UNVERIFIED —
+// freeink-sdk marks it an "Upcoming Device" with no hardware validation;
+// see docs/board-notes/sticky.md. Where a board has real hardware the
+// M5-era original also had (X3's IMU/RTC/battery gauge, X4 Pro's
+// touch/frontlight/RTC/gauge, PaperS3's touch/RTC, Sticky's RTC/IMU/gauge,
+// Paper Mono's RTC), this file uses it via
 // BoardConfig::hasImu()/hasRtc()/isX4Pro()/isMurphyM3()/isM5PaperS3()/
 // isSticky() and the Imu/Rtc/FrontlightManager libraries; where a board has
 // none of it (X4: BoardConfig::XTEINK_X4 is NO_SENSORS/NO_AUDIO/NO_LEDS/
@@ -31,8 +32,9 @@
 // system" for what's substituted versus real per board; see
 // docs/board-notes/murphy-m3.md, docs/board-notes/papers3.md,
 // docs/board-notes/lilygo-t5s3.md, docs/board-notes/papercolor.md,
-// docs/board-notes/delink.md, and docs/board-notes/sticky.md for those
-// boards' port-specific findings. PaperS3 has NO physical buttons at all —
+// docs/board-notes/delink.md, docs/board-notes/sticky.md, and
+// docs/board-notes/paper-mono.md for those boards' port-specific findings.
+// PaperS3 has NO physical buttons at all —
 // see the "PaperS3 touch-only navigation" block near handleInput() below.
 //
 // See README.md for the sprite-region size, the full-refresh timer
@@ -841,9 +843,9 @@ static int16_t drawInfoPage(uint32_t now, int16_t y) {
     ln(Color::Black, BoardConfig::ACTIVE.name);
     // Read the actual silicon rather than keeping a per-board S3-vs-C3
     // boolean list here — every new S3 board this project adds would
-    // otherwise need this line touched again (it already had to be, five
+    // otherwise need this line touched again (it already had to be, six
     // times over: X4 Pro, then Murphy/PaperS3, then LilyGo/PaperColor, then
-    // de-link, then Sticky).
+    // de-link, then Sticky, then Paper Mono).
     ln(Color::Black, ESP.getChipModel());
   }
   return y;
@@ -1626,9 +1628,9 @@ void setup() {
   // assigned (not PIN_UNASSIGNED) excludes both boards correctly alongside
   // the busWidth check, without needing a per-board name comparison.
   // Boards with native SDMMC (X4 Pro: 1-bit; de-link: 4-bit — BoardConfig.h
-  // DE_LINK.sdmmc, ~line 1108) never enter this branch either: their SD
-  // card is on entirely separate pins, not a shared SPI bus, and
-  // sdmmc.busWidth != 0 for both.
+  // DE_LINK.sdmmc, ~line 1108; Paper Mono: 4-bit, BoardConfig.h:968) never
+  // enter this branch either: their SD card is on entirely separate pins,
+  // not a shared SPI bus, and sdmmc.busWidth != 0 for all three.
   if (BoardConfig::ACTIVE.sdmmc.busWidth == 0 && BoardConfig::ACTIVE.display.sclk != BoardConfig::PIN_UNASSIGNED) {
     SPI.begin(BoardConfig::ACTIVE.display.sclk, BoardConfig::ACTIVE.sd.miso, BoardConfig::ACTIVE.display.mosi,
               BoardConfig::ACTIVE.display.cs);
